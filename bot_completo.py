@@ -483,9 +483,15 @@ async def finalize_booking(cb_or_update, context: ContextTypes.DEFAULT_TYPE, svc
     user_obj = cb_or_update.callback_query.from_user if hasattr(cb_or_update, "callback_query") else cb_or_update
     if isinstance(user_obj, int): user_id = user_obj; username = None
     else: user_id = user_obj.id; username = getattr(user_obj, "username", None) or context.user_data.get("username")
+    # Salva/aggiorna dati utente in modo centralizzato
+    save_or_update_user(
+        user_id=user_id,
+        username=username,
+        name=context.user_data.get("name"),
+        phone=context.user_data.get("phone"),
+        notes=context.user_data.get("notes"),
+    )
     con = db_conn(); cur = con.cursor()
-    cur.execute("INSERT OR IGNORE INTO users (user_id, username, name, phone, notes) VALUES (?,?,?,?,?)", (user_id, username, context.user_data.get("name"), context.user_data.get("phone"), context.user_data.get("notes")))
-    cur.execute("UPDATE users SET username=?, name=?, phone=?, notes=? WHERE user_id=?", (username, context.user_data.get("name"), context.user_data.get("phone"), context.user_data.get("notes"), user_id))
     cur.execute("""INSERT INTO bookings (user_id, service_code, service_name, date, time, duration, operator_id, price, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, svc.get("prezzo", 0.0), datetime.utcnow().isoformat()))
     booking_id = cur.lastrowid; con.commit(); con.close(); logger.info(f"Booking saved: id={booking_id} user={user_id} svc={svc['code']} date={date_str} time={time_str} op={op_id}")
