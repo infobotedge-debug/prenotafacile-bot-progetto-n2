@@ -543,6 +543,11 @@ async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAU
             context.application.job_queue.run_once(send_reminder_job, when=30, data={"user_id": user_id, "service_name": f"{svc['nome']} (TEST)", "date_str": date.today().strftime('%Y-%m-%d'), "time_str": datetime.now().strftime('%H:%M')})
         except Exception as e:
             logger.warning("Failed to schedule quick test reminder (accept): %s", e)
+    # Avvisa gli altri utenti in lista d'attesa che lo slot è stato preso
+    try:
+        await notify_waitlist_slot_taken(context, date_str, time_str, svc["code"], svc["nome"], exclude_user_id=user_id)
+    except Exception as e:
+        logger.debug("notify_waitlist_slot_taken fallita: %s", e)
 
 async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE, booking_id: int):
     q = update.callback_query; con = db_conn(); cur = con.cursor(); cur.execute("SELECT user_id, service_code, service_name, date, time, operator_id FROM bookings WHERE id= ?", (booking_id,)); row = cur.fetchone()
@@ -590,7 +595,12 @@ async def waitlist_step_job(context: ContextTypes.DEFAULT_TYPE):
     if not is_slot_free_for_operator(date_str, time_str, svc["durata"], op_id):
         return
     uid = users[idx]
-    text = (f"ℹ️ Si è liberato uno slot per *{svc_name}*\n" f"📅 {datetime.strptime(date_str, '%Y-%m-%d').strftime('%d/%m/%Y')} 🕒 {time_str}\n\n" "Premi il bottone per prenotarlo ora (primo che conferma lo ottiene).")
+    text = (
+        f"ℹ️ Si è liberato uno slot per *{svc_name}*\n"
+        f"📅 {datetime.strptime(date_str, '%Y-%m-%d').strftime('%d/%m/%Y')} 🕒 {time_str}\n\n"
+        "Premi il bottone per prenotarlo ora (primo che conferma lo ottiene).\n"
+        f"⏳ Hai {WAITLIST_STEP_SECONDS} secondi prima che venga proposto al prossimo."
+    )
     kb = [[InlineKeyboardButton("📌 Prenota questo slot", callback_data=f"accept_slot_{date_str}_{time_str}_{op_id}_{svc_code}")]]
     try:
         await context.application.bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
@@ -615,6 +625,33 @@ async def waitlist_step_job(context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logger.debug("Pianificazione step waitlist fallita: %s", e)
+
+async def notify_waitlist_slot_taken(context: ContextTypes.DEFAULT_TYPE, date_str: str, time_str: str, svc_code: str, svc_name: str, exclude_user_id: int | None = None):
+    """Informa gli altri utenti in lista d'attesa che lo slot è stato preso."""
+    con = db_conn(); cur = con.cursor()
+    if exclude_user_id is not None:
+        cur.execute(
+            "SELECT DISTINCT user_id FROM waitlist WHERE date=? AND service_code=? AND user_id<>? ORDER BY id ASC",
+            (date_str, svc_code, exclude_user_id),
+        )
+    else:
+        cur.execute(
+            "SELECT DISTINCT user_id FROM waitlist WHERE date=? AND service_code=? ORDER BY id ASC",
+            (date_str, svc_code),
+        )
+    others = [r[0] for r in cur.fetchall()]
+    con.close()
+    if not others:
+        return
+    msg = (
+        f"❕ Lo slot per *{svc_name}* del {datetime.strptime(date_str, '%Y-%m-%d').strftime('%d/%m/%Y')} alle {time_str} è stato prenotato da un altro utente.\n"
+        "Resterai in lista d'attesa e ti avviseremo se se ne libera un altro."
+    )
+    for uid in others:
+        try:
+            await context.application.bot.send_message(uid, msg, parse_mode=ParseMode.MARKDOWN)
+        except Exception as e:
+            logger.debug("Notifica 'slot preso' fallita per user=%s: %s", uid, e)
 
 # Reminder
 async def reminder_background(delay_seconds: float, user_id: int, service_name: str, date_str: str, time_str: str, context: ContextTypes.DEFAULT_TYPE):
