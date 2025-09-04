@@ -692,11 +692,13 @@ async def test_after_confirm_cmd(update: Update, context: ContextTypes.DEFAULT_T
 
 # Helpers
 
-def find_service_by_code(code: str):
-    for gender, cats in SERVIZI.items():
-        for cat, items in cats.items():
-            for it in items:
-                if it["code"] == code: return it
+def find_service_by_code(code: str) -> dict | None:
+    """Restituisce il dizionario del servizio corrispondente al codice."""
+    for _, cats in SERVIZI.items():
+        for cat_items in cats.values():
+            for svc in cat_items:
+                if svc["code"] == code:
+                    return svc
     return None
 
 # Conversation
