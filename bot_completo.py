@@ -489,17 +489,30 @@ async def confirm_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_my_bookings(update_or_cb, context: ContextTypes.DEFAULT_TYPE, via_callback=False):
     user = update_or_cb.callback_query.from_user if via_callback else update_or_cb.message.from_user
-    con = db_conn(); cur = con.cursor(); cur.execute("SELECT id, service_name, date, time, duration, operator_id FROM bookings WHERE user_id=? ORDER BY date, time", (user.id,)); rows = cur.fetchall(); con.close()
+    con = db_conn(); cur = con.cursor();
+    cur.execute("SELECT id, service_name, date, time, duration, operator_id, price FROM bookings WHERE user_id=? ORDER BY date, time", (user.id,))
+    rows = cur.fetchall(); con.close()
     if not rows:
-        if via_callback: await update_or_cb.callback_query.edit_message_text("Non hai prenotazioni attive.")
-        else: await update_or_cb.message.reply_text("Non hai prenotazioni attive."); return
-    lines = []; kb = []
-    for bid, sname, d, t, dur, op in rows:
-        lines.append(f"• [{bid}] {sname} – {datetime.strptime(d,'%Y-%m-%d').strftime('%d/%m/%Y')} {t} ({dur} min) - {operator_name(op)}")
+        if via_callback:
+            await update_or_cb.callback_query.edit_message_text("Non hai prenotazioni attive.")
+        else:
+            await update_or_cb.message.reply_text("Non hai prenotazioni attive.")
+        return
+    lines = []
+    kb = []
+    for bid, sname, d, t, dur, op, price in rows:
+        giorno = datetime.strptime(d, '%Y-%m-%d').strftime('%d/%m/%Y')
+        prezzo = format_price_eur(price)
+        lines.append(f"• [{bid}] {sname} – {giorno} {t} ({dur} min) – {operator_name(op)} – {prezzo}")
         kb.append([InlineKeyboardButton(f"❌ Disdici [{bid}]", callback_data=f"cancel_{bid}")])
-    text = "*Le tue prenotazioni:*\n" + "\n".join(lines)
-    if via_callback: await update_or_cb.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-    else: await update_or_cb.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    header = f"*Le tue prenotazioni ({len(rows)}):*\n"
+    # Aggiunge un tasto per tornare al menu principale
+    kb.append([InlineKeyboardButton("🏠 Menu", callback_data="home")])
+    text = header + "\n".join(lines)
+    if via_callback:
+        await update_or_cb.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update_or_cb.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
 # Operatrici
 
@@ -747,6 +760,16 @@ def normalize_price(value) -> float:
         except Exception:
             return 0.0
     return 0.0
+
+def format_price_eur(value) -> str:
+    """Formatta un prezzo in euro, con fallback a '—'."""
+    try:
+        if value is None:
+            return "—"
+        v = float(value)
+        return f"€{v:.2f}"
+    except Exception:
+        return "—"
 
 # Conversation
 
