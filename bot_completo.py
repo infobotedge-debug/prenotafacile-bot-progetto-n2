@@ -436,7 +436,13 @@ async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if notes.lower() == "no": notes = None
     context.user_data["notes"] = notes
     svc = context.user_data["service"]; date_str = context.user_data["date"]; time_str = context.user_data["time"]; op_id = context.user_data.get("operator_id")
-    text = (f"Riepilogo:\n• Servizio: *{svc['nome']}* ({svc['durata']} min)\n"
+    # Format prezzo se disponibile
+    prezzo_val = svc.get("prezzo")
+    if isinstance(prezzo_val, (int, float)):
+        prezzo_txt = f"€{prezzo_val:.2f}"
+    else:
+        prezzo_txt = "—"
+    text = (f"Riepilogo:\n• Servizio: *{svc['nome']}* ({svc['durata']} min) - {prezzo_txt}\n"
             f"• Operatrice: *{operator_name(op_id)}*\n"
             f"• Data: *{datetime.strptime(date_str, '%Y-%m-%d').strftime('%d/%m/%Y')}*\n"
             f"• Ora: *{time_str}*\n"
