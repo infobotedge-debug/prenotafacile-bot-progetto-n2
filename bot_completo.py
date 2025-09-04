@@ -126,6 +126,20 @@ def init_db():
 
 # Utils calendario
 
+# ------------------------
+# LISTA D'ATTESA - helper
+# ------------------------
+async def join_waitlist(user_id: int, date_str: str, svc_code: str):
+    """Aggiunge l'utente alla lista d'attesa per una data e un servizio."""
+    con = db_conn()
+    cur = con.cursor()
+    cur.execute(
+        "INSERT INTO waitlist (user_id, date, service_code, created_at) VALUES (?,?,?,?)",
+        (user_id, date_str, svc_code, datetime.utcnow().isoformat()),
+    )
+    con.commit()
+    con.close()
+
 def parse_time_hhmm(s: str) -> time:
     h, m = map(int, s.split(":")); return time(hour=h, minute=m)
 
@@ -243,22 +257,47 @@ async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
             year = int(parts[1]) if len(parts)>1 else date.today().year; await show_month_picker(q, context, year, 1)
         return ASK_MONTH
     if data.startswith("day_"):
-        date_str = data.split("_",1)[1]; context.user_data["date"] = date_str
-        svc = context.user_data.get("service"); op_id = context.user_data.get("operator_id")
-        if not svc or not op_id: await q.edit_message_text("Sessione scaduta. Premi /start"); return ConversationHandler.END
-        d = datetime.strptime(date_str, "%Y-%m-%d").date(); free = free_slots_for_operator(d, svc["durata"], op_id)
+        date_str = data.split("_", 1)[1]
+        context.user_data["date"] = date_str
+        svc = context.user_data.get("service")
+        op_id = context.user_data.get("operator_id")
+        if not svc or not op_id:
+            await q.edit_message_text("Sessione scaduta. Premi /start")
+            return ConversationHandler.END
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        free = free_slots_for_operator(d, svc["durata"], op_id)
         if free:
-            kb = [[InlineKeyboardButton(t, callback_data=f"time_{t}")] for t in free]; kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data=f"cal_{d.year}_{d.month}")])
+            kb = [[InlineKeyboardButton(t, callback_data=f"time_{t}")] for t in free]
+            kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data=f"cal_{d.year}_{d.month}")])
+            # Mantieni i nomi dei giorni in italiano
             weekday_it = ITALIAN_WEEKDAYS_FULL[d.weekday()]
-            await q.edit_message_text(f"Data: *{weekday_it} {d.strftime('%d/%m/%Y')}*\nScegli un orario disponibile:", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN); return ASK_TIME
+            await q.edit_message_text(
+                f"Data: *{weekday_it} {d.strftime('%d/%m/%Y')}*\nScegli un orario disponibile:",
+                reply_markup=InlineKeyboardMarkup(kb),
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return ASK_TIME
         else:
-            kb = [[InlineKeyboardButton("🕰️ Entra in lista d'attesa", callback_data="waitlist_join")],[InlineKeyboardButton("⬅️ Indietro", callback_data=f"cal_{d.year}_{d.month}")]]
-            await q.edit_message_text("🔴 Questo giorno è pieno per l'operatrice scelta.\nVuoi entrare in lista d'attesa?", reply_markup=InlineKeyboardMarkup(kb)); return ASK_DAY
+            # Giorno pieno -> proponi la lista d'attesa
+            kb = [
+                [InlineKeyboardButton("🕰️ Entra in lista d'attesa", callback_data="waitlist_join")],
+                [InlineKeyboardButton("⬅️ Indietro", callback_data=f"cal_{d.year}_{d.month}")],
+            ]
+            await q.edit_message_text(
+                "🔴 Questo giorno è pieno per l'operatrice scelta.\nVuoi entrare in lista d'attesa?",
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+            return ASK_DAY
     if data == "waitlist_join":
-        user = q.from_user; date_str = context.user_data.get("date"); svc = context.user_data.get("service")
-        if not date_str or not svc: await q.edit_message_text("Sessione scaduta. Premi /start"); return ConversationHandler.END
-        con = db_conn(); cur = con.cursor(); cur.execute("INSERT INTO waitlist (user_id, date, service_code, created_at) VALUES (?,?,?,?)", (user.id, date_str, svc["code"], datetime.utcnow().isoformat())); con.commit(); con.close()
-        await q.edit_message_text("✅ Inserito in lista d'attesa. Ti notificheremo se si libera uno slot."); return ConversationHandler.END
+        user = q.from_user
+        date_str = context.user_data.get("date")
+        svc = context.user_data.get("service")
+        if not date_str or not svc:
+            await q.edit_message_text("Sessione scaduta. Premi /start")
+            return ConversationHandler.END
+        await join_waitlist(user.id, date_str, svc["code"])  # helper
+        await q.edit_message_text("✅ Inserito in lista d'attesa. Ti notificheremo se si libera uno slot.")
+        return ConversationHandler.END
     if data.startswith("time_"):
         time_str = data.split("_",1)[1]; context.user_data["time"] = time_str
         await q.edit_message_text("Perfetto. Inserisci *Nome e Cognome*:", parse_mode=ParseMode.MARKDOWN); return ASK_NAME
