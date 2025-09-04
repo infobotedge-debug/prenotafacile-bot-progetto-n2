@@ -178,16 +178,38 @@ def list_all_slots_for_day(d: date, durata: int) -> List[str]:
     return slots
 
 def is_slot_free_for_operator(date_str: str, time_str: str, durata: int, operator_id: str) -> bool:
-    con = db_conn()
+    """Verifica se uno slot è libero per un operatore.
+
+    Calcola new_start/new_end e controlla sovrapposizioni con le prenotazioni esistenti
+    nello stesso giorno e per lo stesso operatore. Ritorna sempre True/False in modo affidabile.
+    """
+    exs = []
+    con = None
     try:
-        con.execute("BEGIN IMMEDIATE")
-    except Exception:
-        pass
-    cur = con.cursor(); cur.execute("SELECT time, duration, operator_id, date FROM bookings WHERE date=? AND operator_id=?", (date_str, operator_id))
-    exs = cur.fetchall(); con.close()
-    new_start = datetime_from_date_time_str(date_str, time_str); new_end = new_start + timedelta(minutes=durata)
-    for t, d, op, dat in exs:
-        ex_start = datetime_from_date_time_str(dat, t); ex_end = ex_start + timedelta(minutes=d)
+        con = db_conn()
+        cur = con.cursor()
+        cur.execute(
+            "SELECT time, duration, date FROM bookings WHERE date=? AND operator_id=?",
+            (date_str, operator_id),
+        )
+        exs = cur.fetchall()
+    except Exception as e:
+        logger.debug("Errore DB in is_slot_free_for_operator: %s", e)
+        # Conservativo: considera non libero in caso di errore DB
+        return False
+    finally:
+        try:
+            if con:
+                con.close()
+        except Exception:
+            pass
+
+    new_start = datetime_from_date_time_str(date_str, time_str)
+    new_end = new_start + timedelta(minutes=int(durata))
+    for t, d, dat in exs:
+        ex_start = datetime_from_date_time_str(dat, t)
+        ex_end = ex_start + timedelta(minutes=int(d))
+        # Sovrapposizione se gli intervalli [new_start,new_end) e [ex_start,ex_end) si intersecano
         if not (new_end <= ex_start or new_start >= ex_end):
             return False
     return True
