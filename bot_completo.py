@@ -144,7 +144,8 @@ async def join_waitlist(user_id: int, date_str: str, svc_code: str) -> int:
         "SELECT COUNT(*) FROM waitlist WHERE date=? AND service_code=? AND id <= ?",
         (date_str, svc_code, cur.lastrowid),
     )
-    pos = cur.fetchone()[0] if cur.fetchone is not None else 1
+    row = cur.fetchone()
+    pos = row[0] if row else 1
     con.close()
     return int(pos) if pos else 1
 
@@ -346,9 +347,10 @@ async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
             await q.edit_message_text("Sessione scaduta. Premi /start")
             return ConversationHandler.END
         pos = await join_waitlist(user.id, date_str, svc["code"])  # helper
+        davanti = max(0, (pos - 1))
         msg = (
             "✅ Inserito in lista d'attesa.\n"
-            f"📍 Posizione stimata: {pos}.\n"
+            f"📍 Posizione stimata: {pos} (persone davanti: {davanti}).\n"
             "Ti notificheremo quando si libera uno slot."
         )
         await q.edit_message_text(msg)
