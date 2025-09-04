@@ -1,0 +1,15 @@
+# Runtime/ambienti
+.venv/
+__pycache__/
+*.pyc
+
+# Dati sensibili / runtime
+token.txt
+prenotafacile.db
+bot_run.log
+bot_err.log
+bot.pid
+
+# Editor/OS
+.DS_Store
+.vscode/

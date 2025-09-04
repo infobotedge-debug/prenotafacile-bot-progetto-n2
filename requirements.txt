@@ -1,0 +1,2 @@
+python-telegram-bot[webhooks]==20.7
+pyngrok>=7.1.0
