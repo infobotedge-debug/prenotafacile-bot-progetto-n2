@@ -49,6 +49,8 @@ try:
 except Exception:
     REMINDER_AFTER_CONFIRM_SECONDS = 30
 REMINDER_QUICK_TEST = os.environ.get("REMINDER_QUICK_TEST", "1").lower() in {"1","true","yes"}
+# Attesa tra notifiche consecutive della lista d'attesa (secondi)
+WAITLIST_STEP_SECONDS = int(os.environ.get("WAITLIST_STEP_SECONDS", "120"))
 
 ORARI_SETTIMANA = {
     0: [("09:00","13:00"),("15:00","19:00")],
@@ -516,9 +518,14 @@ async def finalize_booking(cb_or_update, context: ContextTypes.DEFAULT_TYPE, svc
 async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAULT_TYPE, svc, date_str: str, time_str: str, op_id: str):
     try:
         chat = await context.application.bot.get_chat(user_id); username = getattr(chat, "username", None)
-    except Exception: username = None
+    except Exception:
+        username = None
+    # Allinea i dati utente
+    try:
+        save_or_update_user(user_id=user_id, username=username)
+    except Exception as e:
+        logger.debug("save_or_update_user (accept) fallito: %s", e)
     con = db_conn(); cur = con.cursor();
-    cur.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?,?)", (user_id, username))
     cur.execute("""INSERT INTO bookings (user_id, service_code, service_name, date, time, duration, operator_id, price, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, svc.get("prezzo",0.0), datetime.utcnow().isoformat()))
     booking_id = cur.lastrowid; con.commit(); con.close()
@@ -543,13 +550,71 @@ async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE, boo
     user_id_db, svc_code, svc_name, date_str, time_str, op_id = row; cur.execute("DELETE FROM bookings WHERE id=?", (booking_id,)); con.commit(); con.close(); await q.edit_message_text("✅ Prenotazione disdetta."); await notify_waitlist(context, date_str, time_str, op_id, svc_code, svc_name)
 
 async def notify_waitlist(context: ContextTypes.DEFAULT_TYPE, date_str: str, time_str: str, op_id: str, svc_code: str, svc_name: str):
-    con = db_conn(); cur = con.cursor(); cur.execute("SELECT DISTINCT user_id FROM waitlist WHERE date=? AND service_code=? ORDER BY id ASC", (date_str, svc_code)); users = [r[0] for r in cur.fetchall()]; con.close()
-    if not users: return
+    """Avvia la notifica sequenziale agli utenti della lista d'attesa."""
+    con = db_conn(); cur = con.cursor()
+    cur.execute("SELECT DISTINCT user_id FROM waitlist WHERE date=? AND service_code=? ORDER BY id ASC", (date_str, svc_code))
+    users = [r[0] for r in cur.fetchall()]
+    con.close()
+    if not users:
+        return
+    # Primo step immediato
+    try:
+        context.application.job_queue.run_once(
+            waitlist_step_job,
+            when=0,
+            data={
+                "users": users,
+                "index": 0,
+                "date_str": date_str,
+                "time_str": time_str,
+                "op_id": op_id,
+                "svc_code": svc_code,
+                "svc_name": svc_name,
+            },
+        )
+    except Exception as e:
+        logger.warning("Pianificazione waitlist fallita: %s", e)
+
+async def waitlist_step_job(context: ContextTypes.DEFAULT_TYPE):
+    data = getattr(context.job, 'data', {}) or {}
+    users = data.get("users") or []
+    idx = int(data.get("index", 0))
+    date_str = data.get("date_str"); time_str = data.get("time_str")
+    op_id = data.get("op_id"); svc_code = data.get("svc_code"); svc_name = data.get("svc_name")
+    if not users or idx >= len(users) or not all([date_str, time_str, op_id, svc_code]):
+        return
+    svc = find_service_by_code(svc_code)
+    if not svc:
+        return
+    # Interrompi se lo slot non è più libero
+    if not is_slot_free_for_operator(date_str, time_str, svc["durata"], op_id):
+        return
+    uid = users[idx]
     text = (f"ℹ️ Si è liberato uno slot per *{svc_name}*\n" f"📅 {datetime.strptime(date_str, '%Y-%m-%d').strftime('%d/%m/%Y')} 🕒 {time_str}\n\n" "Premi il bottone per prenotarlo ora (primo che conferma lo ottiene).")
     kb = [[InlineKeyboardButton("📌 Prenota questo slot", callback_data=f"accept_slot_{date_str}_{time_str}_{op_id}_{svc_code}")]]
-    for uid in users:
-        try: await context.application.bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
-        except Exception: pass
+    try:
+        await context.application.bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.debug("Invio notifica waitlist fallito per user=%s: %s", uid, e)
+    # Pianifica il prossimo utente se resta libero
+    next_idx = idx + 1
+    if next_idx < len(users):
+        try:
+            context.application.job_queue.run_once(
+                waitlist_step_job,
+                when=max(1, WAITLIST_STEP_SECONDS),
+                data={
+                    "users": users,
+                    "index": next_idx,
+                    "date_str": date_str,
+                    "time_str": time_str,
+                    "op_id": op_id,
+                    "svc_code": svc_code,
+                    "svc_name": svc_name,
+                },
+            )
+        except Exception as e:
+            logger.debug("Pianificazione step waitlist fallita: %s", e)
 
 # Reminder
 async def reminder_background(delay_seconds: float, user_id: int, service_name: str, date_str: str, time_str: str, context: ContextTypes.DEFAULT_TYPE):
