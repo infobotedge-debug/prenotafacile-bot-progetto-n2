@@ -522,8 +522,9 @@ async def finalize_booking(cb_or_update, context: ContextTypes.DEFAULT_TYPE, svc
         notes=context.user_data.get("notes"),
     )
     con = db_conn(); cur = con.cursor()
+    price_val = normalize_price(svc.get("prezzo"))
     cur.execute("""INSERT INTO bookings (user_id, service_code, service_name, date, time, duration, operator_id, price, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, svc.get("prezzo", 0.0), datetime.utcnow().isoformat()))
+                   VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, price_val, datetime.utcnow().isoformat()))
     booking_id = cur.lastrowid; con.commit(); con.close(); logger.info(f"Booking saved: id={booking_id} user={user_id} svc={svc['code']} date={date_str} time={time_str} op={op_id}")
     appt_dt = datetime_from_date_time_str(date_str, time_str); remind_at = appt_dt - timedelta(seconds=REMINDER_TEST_SECONDS); delay = (remind_at - datetime.now()).total_seconds();
     if delay < 1: delay = 1
@@ -554,8 +555,9 @@ async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAU
     except Exception as e:
         logger.debug("save_or_update_user (accept) fallito: %s", e)
     con = db_conn(); cur = con.cursor();
+    price_val = normalize_price(svc.get("prezzo"))
     cur.execute("""INSERT INTO bookings (user_id, service_code, service_name, date, time, duration, operator_id, price, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, svc.get("prezzo",0.0), datetime.utcnow().isoformat()))
+                   VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, price_val, datetime.utcnow().isoformat()))
     booking_id = cur.lastrowid; con.commit(); con.close()
     appt_dt = datetime_from_date_time_str(date_str, time_str); remind_at = appt_dt - timedelta(seconds=REMINDER_TEST_SECONDS); delay = (remind_at - datetime.now()).total_seconds();
     if delay < 1: delay = 1
@@ -728,6 +730,23 @@ def find_service_by_code(code: str) -> dict | None:
                 if svc["code"] == code:
                     return svc
     return None
+
+def normalize_price(value) -> float:
+    """Normalizza il prezzo in un float.
+
+    Accetta numeri, stringhe con simbolo € o virgole, spazi; altrimenti 0.0.
+    """
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        v = value.strip().replace("€", "").replace(" ", "").replace(",", ".")
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+    return 0.0
 
 # Conversation
 
