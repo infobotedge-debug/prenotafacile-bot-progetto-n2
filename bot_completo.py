@@ -140,6 +140,26 @@ async def join_waitlist(user_id: int, date_str: str, svc_code: str):
     con.commit()
     con.close()
 
+# ------------------------
+# UTENTE - SALVATAGGIO E AGGIORNAMENTO
+# ------------------------
+def save_or_update_user(user_id: int, username: str | None = None, name: str | None = None, phone: str | None = None, notes: str | None = None):
+    """Salva o aggiorna i dati utente in modo robusto."""
+    con = db_conn()
+    cur = con.cursor()
+    # Inserisce solo se non esiste
+    cur.execute(
+        "INSERT OR IGNORE INTO users (user_id, username, name, phone, notes) VALUES (?,?,?,?,?)",
+        (user_id, username, name, phone, notes),
+    )
+    # Aggiorna dati esistenti
+    cur.execute(
+        "UPDATE users SET username=?, name=?, phone=?, notes=? WHERE user_id=?",
+        (username, name, phone, notes, user_id),
+    )
+    con.commit()
+    con.close()
+
 def parse_time_hhmm(s: str) -> time:
     h, m = map(int, s.split(":")); return time(hour=h, minute=m)
 
