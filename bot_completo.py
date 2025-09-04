@@ -131,16 +131,22 @@ def init_db():
 # ------------------------
 # LISTA D'ATTESA - helper
 # ------------------------
-async def join_waitlist(user_id: int, date_str: str, svc_code: str):
-    """Aggiunge l'utente alla lista d'attesa per una data e un servizio."""
-    con = db_conn()
-    cur = con.cursor()
+async def join_waitlist(user_id: int, date_str: str, svc_code: str) -> int:
+    """Aggiunge l'utente alla lista d'attesa e restituisce la posizione (1-based)."""
+    con = db_conn(); cur = con.cursor()
     cur.execute(
         "INSERT INTO waitlist (user_id, date, service_code, created_at) VALUES (?,?,?,?)",
         (user_id, date_str, svc_code, datetime.utcnow().isoformat()),
     )
     con.commit()
+    # Calcola posizione corrente
+    cur.execute(
+        "SELECT COUNT(*) FROM waitlist WHERE date=? AND service_code=? AND id <= ?",
+        (date_str, svc_code, cur.lastrowid),
+    )
+    pos = cur.fetchone()[0] if cur.fetchone is not None else 1
     con.close()
+    return int(pos) if pos else 1
 
 # ------------------------
 # UTENTE - SALVATAGGIO E AGGIORNAMENTO
@@ -339,8 +345,13 @@ async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         if not date_str or not svc:
             await q.edit_message_text("Sessione scaduta. Premi /start")
             return ConversationHandler.END
-        await join_waitlist(user.id, date_str, svc["code"])  # helper
-        await q.edit_message_text("✅ Inserito in lista d'attesa. Ti notificheremo se si libera uno slot.")
+        pos = await join_waitlist(user.id, date_str, svc["code"])  # helper
+        msg = (
+            "✅ Inserito in lista d'attesa.\n"
+            f"📍 Posizione stimata: {pos}.\n"
+            "Ti notificheremo quando si libera uno slot."
+        )
+        await q.edit_message_text(msg)
         return ConversationHandler.END
     if data.startswith("time_"):
         time_str = data.split("_",1)[1]; context.user_data["time"] = time_str
