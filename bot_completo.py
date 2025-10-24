@@ -94,12 +94,6 @@ OPERATRICI = [
 
 SERVIZI = {
     "Donna": {
-        "Capelli": [
-            {"code":"d_capelli_taglio","nome":"Taglio Donna","durata":30,"prezzo":20},
-            {"code":"d_capelli_piega","nome":"Piega","durata":30,"prezzo":18},
-            {"code":"d_capelli_colore","nome":"Colore","durata":60,"prezzo":45},
-            {"code":"d_capelli_meches","nome":"Colpi di sole / Meches","durata":90,"prezzo":80},
-        ],
         "Trattamenti Viso": [
             {"code":"d_viso_pulizia","nome":"Pulizia del viso","durata":60,"prezzo":40},
             {"code":"d_viso_antiage","nome":"Trattamento anti-age","durata":75,"prezzo":60},
@@ -123,12 +117,6 @@ SERVIZI = {
         ],
     },
     "Uomo": {
-        "Capelli / Barba": [
-            {"code":"u_taglio","nome":"Taglio Uomo","durata":20,"prezzo":15},
-            {"code":"u_barba_regolazione","nome":"Regolazione barba","durata":20,"prezzo":10},
-            {"code":"u_barba_rasatura","nome":"Rasatura completa","durata":20,"prezzo":12},
-            {"code":"u_combo_taglio_barba","nome":"Combo Taglio + Barba","durata":40,"prezzo":25},
-        ],
         "Trattamenti Viso": [
             {"code":"u_viso_pulizia","nome":"Pulizia del viso","durata":60,"prezzo":40},
             {"code":"u_viso_purificante","nome":"Trattamento viso purificante","durata":45,"prezzo":35},
