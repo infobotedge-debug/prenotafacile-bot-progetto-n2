@@ -6,9 +6,11 @@ Dipendenze: vedi requirements.txt
 Avvio: scripts/start_polling.ps1 (Windows)
 """
 import os, calendar, sqlite3, asyncio, logging
+from io import BytesIO
+import csv
 from datetime import datetime, date, time, timedelta
 from typing import List
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
@@ -49,8 +51,29 @@ try:
 except Exception:
     REMINDER_AFTER_CONFIRM_SECONDS = 30
 REMINDER_QUICK_TEST = os.environ.get("REMINDER_QUICK_TEST", "1").lower() in {"1","true","yes"}
+# In modalità quick test, se non specificato via env, usa 5 secondi per il promemoria post-conferma
+if REMINDER_QUICK_TEST and ("REMINDER_AFTER_CONFIRM_SECONDS" not in os.environ):
+    REMINDER_AFTER_CONFIRM_SECONDS = 5
 # Attesa tra notifiche consecutive della lista d'attesa (secondi)
 WAITLIST_STEP_SECONDS = int(os.environ.get("WAITLIST_STEP_SECONDS", "120"))
+
+# Admin
+def get_admin_ids() -> set[int]:
+    raw = os.environ.get("ADMIN_IDS", "").strip()
+    ids: set[int] = set()
+    if raw:
+        for part in raw.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                ids.add(int(part))
+            except Exception:
+                pass
+    return ids
+
+def is_admin(user_id: int) -> bool:
+    return user_id in get_admin_ids()
 
 ORARI_SETTIMANA = {
     0: [("09:00","13:00"),("15:00","19:00")],
@@ -62,27 +85,59 @@ ORARI_SETTIMANA = {
     6: []
 }
 
+# Operatori: aggiornati per riflettere i nomi proposti dall'utente
 OPERATRICI = [
-    {"id":"op_anna","name":"Anna"},
-    {"id":"op_luca","name":"Luca"},
-    {"id":"op_maria","name":"Maria"},
+    {"id":"op_sara","name":"Sara"},
+    {"id":"op_giulia","name":"Giulia"},
+    {"id":"op_martina","name":"Martina"},
 ]
 
 SERVIZI = {
     "Donna": {
+        "Capelli": [
+            {"code":"d_capelli_taglio","nome":"Taglio Donna","durata":30,"prezzo":20},
+            {"code":"d_capelli_piega","nome":"Piega","durata":30,"prezzo":18},
+            {"code":"d_capelli_colore","nome":"Colore","durata":60,"prezzo":45},
+            {"code":"d_capelli_meches","nome":"Colpi di sole / Meches","durata":90,"prezzo":80},
+        ],
         "Trattamenti Viso": [
-            {"code":"d_pulizia_viso","nome":"Pulizia del viso","durata":60,"prezzo":40},
-            {"code":"d_antiage","nome":"Trattamento anti-age","durata":75,"prezzo":60},
+            {"code":"d_viso_pulizia","nome":"Pulizia del viso","durata":60,"prezzo":40},
+            {"code":"d_viso_antiage","nome":"Trattamento anti-age","durata":75,"prezzo":60},
+            {"code":"d_viso_trattamento","nome":"Trattamento viso","durata":45,"prezzo":35},
         ],
         "Unghie": [
-            {"code":"d_manicure","nome":"Manicure classica","durata":40,"prezzo":20},
+            {"code":"d_unghie_semipermanente","nome":"Semipermanente mani","durata":60,"prezzo":30},
+            {"code":"d_unghie_refill_gel","nome":"Refill gel","durata":75,"prezzo":40},
+            {"code":"d_unghie_manicure","nome":"Manicure classica","durata":40,"prezzo":20},
+            {"code":"d_unghie_pedicure","nome":"Pedicure","durata":45,"prezzo":25},
+        ],
+        "Estetica": [
+            {"code":"d_estetica_epilazione","nome":"Epilazione completa","durata":60,"prezzo":35},
+            {"code":"d_estetica_sopracciglia","nome":"Definizione sopracciglia","durata":15,"prezzo":8},
+            {"code":"d_estetica_ceretta_completa","nome":"Ceretta completa","durata":60,"prezzo":40},
+            {"code":"d_estetica_extension_ciglia","nome":"Extension ciglia","durata":90,"prezzo":60},
+        ],
+        "Massaggi": [
+            {"code":"d_massaggio_decontr","nome":"Massaggio decontratturante","durata":50,"prezzo":50},
+            {"code":"d_massaggio_rilass","nome":"Massaggio rilassante","durata":50,"prezzo":45},
         ],
     },
     "Uomo": {
+        "Capelli / Barba": [
+            {"code":"u_taglio","nome":"Taglio Uomo","durata":20,"prezzo":15},
+            {"code":"u_barba_regolazione","nome":"Regolazione barba","durata":20,"prezzo":10},
+            {"code":"u_barba_rasatura","nome":"Rasatura completa","durata":20,"prezzo":12},
+            {"code":"u_combo_taglio_barba","nome":"Combo Taglio + Barba","durata":40,"prezzo":25},
+        ],
         "Trattamenti Viso": [
-            {"code":"u_pulizia_viso","nome":"Pulizia del viso uomo","durata":60,"prezzo":40},
-        ]
-    }
+            {"code":"u_viso_pulizia","nome":"Pulizia del viso","durata":60,"prezzo":40},
+            {"code":"u_viso_purificante","nome":"Trattamento viso purificante","durata":45,"prezzo":35},
+        ],
+        "Estetica": [
+            {"code":"u_estetica_sopracciglia","nome":"Definizione sopracciglia","durata":15,"prezzo":8},
+            {"code":"u_estetica_epilazione_schiena","nome":"Epilazione schiena","durata":40,"prezzo":30},
+        ],
+    },
 }
 
 # DB
@@ -269,12 +324,24 @@ async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         code = data.split("_",1)[1]; svc = find_service_by_code(code)
         if not svc: await q.edit_message_text("Servizio non trovato."); return ASK_SERVICE
         context.user_data["service"] = svc
-        kb = [[InlineKeyboardButton(op["name"], callback_data=f"op_{op['id']}")] for op in OPERATRICI]
+        kb = [[InlineKeyboardButton(op["name"], callback_data=f"opid_{op['id']}")] for op in OPERATRICI]
         kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data=f"cat_{context.user_data['category']}")])
         await q.edit_message_text(f"Hai scelto *{svc['nome']}* ({svc['durata']} min)\nSeleziona l'operatrice/operatore:", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN); return ASK_OPERATOR
-    if data.startswith("op_"):
-        op_id = data.split("_",1)[1]; context.user_data["operator_id"] = op_id
-        today = date.today(); await show_calendar_month(q, context, today.year, today.month); return ASK_MONTH
+    if data.startswith("op_") or data.startswith("opid_"):
+        parts = data.split("_", 1)
+        op_id = parts[1] if len(parts) > 1 else ""
+        logger.info("Operator selected: %s", op_id)
+        context.user_data["operator_id"] = op_id
+        today = date.today()
+        try:
+            await show_calendar_month(q, context, today.year, today.month)
+        except Exception as e:
+            logger.exception("Errore in show_calendar_month: %s", e)
+            try:
+                await q.edit_message_text("Errore nel mostrare il calendario. Premi /start e riprova.")
+            except Exception:
+                pass
+        return ASK_MONTH
     if data.startswith("cal_"):
         parts = data.split("_")
         if len(parts) >= 3:
@@ -360,10 +427,43 @@ async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.edit_message_text("Perfetto. Inserisci *Nome e Cognome*:", parse_mode=ParseMode.MARKDOWN); return ASK_NAME
     if data.startswith("accept_slot_"):
         payload = data[len("accept_slot_"):]
-        try:
-            date_str, time_str, op_id, svc_code = payload.split("_",3)
-        except Exception:
-            await q.edit_message_text("Dati slot non validi."); return
+        # Nuovo formato con separatore sicuro '|': date|time|op_id|svc_code
+        if "|" in payload:
+            try:
+                date_str, time_str, op_id, svc_code = payload.split("|", 3)
+            except Exception:
+                await q.edit_message_text("Dati slot non validi."); return
+        else:
+            # Back-compat: vecchio formato con '_' che collide con i campi
+            try:
+                if len(payload) < 17 or payload[10] != '_' or payload[16] != '_':
+                    raise ValueError("payload legacy malformato")
+                date_str = payload[:10]
+                time_str = payload[11:16]
+                rest = payload[17:]
+                # rest = f"{op_id}_{svc_code}" ma entrambi possono contenere '_'
+                # Ricava svc_code facendo match con i codici esistenti (scegli il più lungo)
+                svc_code = None
+                op_id = None
+                svc_codes = []
+                for _, cats in SERVIZI.items():
+                    for cat_items in cats.values():
+                        for s in cat_items:
+                            svc_codes.append(s["code"])
+                best = None
+                for code in svc_codes:
+                    if rest.endswith(code) and (best is None or len(code) > len(best)):
+                        best = code
+                if best is None:
+                    raise ValueError("svc_code non riconosciuto nel payload legacy")
+                svc_code = best
+                # Rimuovi separatore '_' tra op_id e svc_code se presente
+                op_part_len = len(rest) - len(svc_code)
+                op_id = rest[:max(0, op_part_len - 1)] if op_part_len > 0 and rest[op_part_len-1] == '_' else rest[:op_part_len]
+                if not op_id:
+                    raise ValueError("op_id vuoto nel payload legacy")
+            except Exception:
+                await q.edit_message_text("Dati slot non validi."); return
         svc = find_service_by_code(svc_code)
         if not svc: await q.edit_message_text("Servizio non valido."); return
         if is_slot_free_for_operator(date_str, time_str, svc["durata"], op_id):
@@ -392,9 +492,16 @@ async def show_calendar_month(q, context, year, month):
             if day == 0:
                 row.append(InlineKeyboardButton(" ", callback_data="ignore"))
             else:
-                ddate = date(year, month, day); wd = ddate.weekday(); ranges = ORARI_SETTIMANA.get(wd, []); is_closed = not ranges; is_today = (ddate == today)
-                symbol = day_status_symbol(ddate, durata) if not is_closed else ""; base_label = f"{day}"; 
-                if is_today: base_label = f"[{day}]"; label = f"{base_label} {symbol}".strip()
+                ddate = date(year, month, day)
+                wd = ddate.weekday()
+                ranges = ORARI_SETTIMANA.get(wd, [])
+                is_closed = not ranges
+                is_today = (ddate == today)
+                symbol = day_status_symbol(ddate, durata) if not is_closed else ""
+                base_label = f"{day}"
+                if is_today:
+                    base_label = f"[{day}]"
+                label = f"{base_label} {symbol}".strip()
                 if is_closed: row.append(InlineKeyboardButton("—", callback_data="ignore"))
                 else: row.append(InlineKeyboardButton(label, callback_data=f"day_{ddate.strftime('%Y-%m-%d')}"))
         kb.append(row)
@@ -448,7 +555,14 @@ async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     notes = update.message.text.strip(); 
     if notes.lower() == "no": notes = None
     context.user_data["notes"] = notes
-    svc = context.user_data["service"]; date_str = context.user_data["date"]; time_str = context.user_data["time"]; op_id = context.user_data.get("operator_id")
+    # Safeguard: if session keys are missing, end gracefully instead of crashing
+    svc = context.user_data.get("service"); date_str = context.user_data.get("date"); time_str = context.user_data.get("time"); op_id = context.user_data.get("operator_id")
+    if not svc or not date_str or not time_str or not op_id:
+        try:
+            await update.message.reply_text("Sessione scaduta o incompleta. Usa /start per ripartire.")
+        except Exception:
+            pass
+        return ConversationHandler.END
     # Format prezzo se disponibile
     prezzo_val = svc.get("prezzo")
     if isinstance(prezzo_val, (int, float)):
@@ -527,6 +641,78 @@ async def show_my_bookings(update_or_cb, context: ContextTypes.DEFAULT_TYPE, via
     else:
         await update_or_cb.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
 
+
+# ------------------------
+# ADMIN - comandi e utilità
+# ------------------------
+async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("Accesso negato. ✋")
+        return
+    # Statistiche rapide
+    con = db_conn(); cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM bookings")
+    tot_book = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM waitlist")
+    tot_wait = cur.fetchone()[0]
+    con.close()
+    kb = [
+        [InlineKeyboardButton("📄 Esporta CSV", callback_data="admin_export")],
+        [InlineKeyboardButton("📅 Prenotazioni di oggi", callback_data="admin_today")],
+    ]
+    await update.message.reply_text(
+        f"Pannello Admin\n• Prenotazioni: {tot_book}\n• In lista d'attesa: {tot_wait}",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def admin_cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if not is_admin(uid):
+        await q.edit_message_text("Accesso negato. ✋")
+        return
+    data = q.data
+    if data == "admin_today":
+        await admin_today_impl(q, context)
+        return
+    if data == "admin_export":
+        await admin_export_impl(q, context)
+        return
+    await q.edit_message_text("Comando admin non riconosciuto.")
+
+async def admin_today_impl(q, context: ContextTypes.DEFAULT_TYPE):
+    dstr = date.today().strftime('%Y-%m-%d')
+    con = db_conn(); cur = con.cursor()
+    cur.execute("SELECT id, user_id, service_name, date, time, duration, operator_id, price FROM bookings WHERE date=? ORDER BY time", (dstr,))
+    rows = cur.fetchall(); con.close()
+    if not rows:
+        await q.edit_message_text("Oggi non ci sono prenotazioni.")
+        return
+    lines = []
+    for bid, uid, sname, d, t, dur, op, price in rows:
+        prezzo = format_price_eur(price)
+        lines.append(f"• [{bid}] {t} – {sname} ({dur}min) – {operator_name(op)} – user:{uid} – {prezzo}")
+    await q.edit_message_text("Prenotazioni di oggi:\n" + "\n".join(lines))
+
+async def admin_export_impl(q, context: ContextTypes.DEFAULT_TYPE):
+    con = db_conn(); cur = con.cursor()
+    cur.execute("SELECT id, user_id, service_code, service_name, date, time, duration, operator_id, price, created_at FROM bookings ORDER BY date, time")
+    rows = cur.fetchall(); con.close()
+    buf = BytesIO()
+    writer = csv.writer(buf)
+    writer.writerow(["id","user_id","service_code","service_name","date","time","duration","operator_id","price","created_at"])
+    for r in rows:
+        writer.writerow(list(r))
+    buf.seek(0)
+    filename = f"prenotazioni_{date.today().isoformat()}.csv"
+    await context.application.bot.send_document(chat_id=q.message.chat_id, document=InputFile(buf, filename), caption="Esportazione prenotazioni")
+    try:
+        await q.delete_message()
+    except Exception:
+        pass
+
 # Operatrici
 
 def operator_name(op_id: str) -> str:
@@ -536,9 +722,44 @@ def operator_name(op_id: str) -> str:
 
 # Prenotazione / Disdetta / Waitlist
 async def finalize_booking(cb_or_update, context: ContextTypes.DEFAULT_TYPE, svc, date_str, time_str, op_id, from_waitlist=False):
-    user_obj = cb_or_update.callback_query.from_user if hasattr(cb_or_update, "callback_query") else cb_or_update
-    if isinstance(user_obj, int): user_id = user_obj; username = None
-    else: user_id = user_obj.id; username = getattr(user_obj, "username", None) or context.user_data.get("username")
+    """Finalizza la prenotazione e pianifica i promemoria.
+
+    cb_or_update può essere:
+    - Update (preferito): in tal caso usiamo effective_user
+    - CallbackQuery: usiamo from_user (NON il suo id!)
+    - int: user_id direttamente
+    """
+    # Estrai l'oggetto utente in modo robusto
+    user_obj = None
+    if isinstance(cb_or_update, int):
+        user_id = cb_or_update
+        username = None
+    else:
+        try:
+            # Caso Update
+            if hasattr(cb_or_update, "effective_user") and cb_or_update.effective_user:
+                user_obj = cb_or_update.effective_user
+            # Caso CallbackQuery
+            elif hasattr(cb_or_update, "from_user") and cb_or_update.from_user:
+                user_obj = cb_or_update.from_user
+            # Caso Update.callback_query
+            elif hasattr(cb_or_update, "callback_query") and cb_or_update.callback_query and getattr(cb_or_update.callback_query, "from_user", None):
+                user_obj = cb_or_update.callback_query.from_user
+        except Exception:
+            user_obj = None
+
+        if user_obj is None:
+            # Fallback estremo: prova dall'Update nel context, altrimenti abort
+            if hasattr(context, "user_data") and "user_id" in context.user_data and isinstance(context.user_data["user_id"], int):
+                user_id = context.user_data["user_id"]
+                username = context.user_data.get("username")
+            else:
+                # Non riusciamo a determinare l'utente correttamente
+                logger.error("Impossibile determinare l'utente per la prenotazione; abort.")
+                return
+        else:
+            user_id = user_obj.id
+            username = getattr(user_obj, "username", None) or context.user_data.get("username")
     # Salva/aggiorna dati utente in modo centralizzato
     save_or_update_user(
         user_id=user_id,
@@ -559,6 +780,7 @@ async def finalize_booking(cb_or_update, context: ContextTypes.DEFAULT_TYPE, svc
     if REMINDER_AFTER_CONFIRM_SECONDS and REMINDER_AFTER_CONFIRM_SECONDS > 0:
         try:
             context.application.job_queue.run_once(send_post_confirm_reminder_job, when=REMINDER_AFTER_CONFIRM_SECONDS, data={"user_id": user_id, "service_name": svc['nome'], "date_str": date_str, "time_str": time_str})
+            logger.info("Scheduled post-confirm reminder in %ss for user=%s", REMINDER_AFTER_CONFIRM_SECONDS, user_id)
         except Exception as e:
             logger.warning("Failed to schedule post-confirm reminder: %s", e)
     if delay > 90 and REMINDER_QUICK_TEST and (not REMINDER_AFTER_CONFIRM_SECONDS or REMINDER_AFTER_CONFIRM_SECONDS <= 0):
@@ -592,6 +814,7 @@ async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAU
     if REMINDER_AFTER_CONFIRM_SECONDS and REMINDER_AFTER_CONFIRM_SECONDS > 0:
         try:
             context.application.job_queue.run_once(send_post_confirm_reminder_job, when=REMINDER_AFTER_CONFIRM_SECONDS, data={"user_id": user_id, "service_name": svc['nome'], "date_str": date_str, "time_str": time_str})
+            logger.info("Scheduled post-confirm reminder in %ss for user=%s (accept)", REMINDER_AFTER_CONFIRM_SECONDS, user_id)
         except Exception as e:
             logger.warning("Failed to schedule post-confirm reminder (accept): %s", e)
     if delay > 90 and REMINDER_QUICK_TEST and (not REMINDER_AFTER_CONFIRM_SECONDS or REMINDER_AFTER_CONFIRM_SECONDS <= 0):
@@ -657,7 +880,8 @@ async def waitlist_step_job(context: ContextTypes.DEFAULT_TYPE):
         "Premi il bottone per prenotarlo ora (primo che conferma lo ottiene).\n"
         f"⏳ Hai {WAITLIST_STEP_SECONDS} secondi prima che venga proposto al prossimo."
     )
-    kb = [[InlineKeyboardButton("📌 Prenota questo slot", callback_data=f"accept_slot_{date_str}_{time_str}_{op_id}_{svc_code}")]]
+    # Usa '|' come separatore per evitare collisioni con '_' nei codici
+    kb = [[InlineKeyboardButton("📌 Prenota questo slot", callback_data=f"accept_slot_{date_str}|{time_str}|{op_id}|{svc_code}")]]
     try:
         await context.application.bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
@@ -803,7 +1027,7 @@ def build_conversation():
             CONFIRM: [CallbackQueryHandler(confirm_router)],
         },
         fallbacks=[CommandHandler("start", start)],
-        allow_reentry=True
+        allow_reentry=True,
     )
 
 # Start/main
@@ -811,7 +1035,7 @@ async def privacy_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Privacy: i dati sono usati per gestire prenotazioni.")
 
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"{BUILD_VERSION}\npython-telegram-bot: 20.x")
+    await update.message.reply_text(f"{BUILD_VERSION}\npython-telegram-bot: 22.x")
 
 async def debug_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -827,6 +1051,10 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(build_conversation())
     app.add_handler(CallbackQueryHandler(confirm_router, pattern=r"^confirm_(yes|no)$"))
+    # Catch-all di sicurezza per i principali callback se uscissi dalla Conversation
+    app.add_handler(CallbackQueryHandler(menu_callback_router, pattern=r"^(gender_|cat_|svc_|op_|cal_|pickmonths_|day_|time_|waitlist_join|accept_slot_|cancel_)"))
+    # Admin callback router
+    app.add_handler(CallbackQueryHandler(admin_cb_router, pattern=r"^admin_"))
     app.add_handler(CommandHandler("help", lambda u,c: asyncio.create_task(u.message.reply_text("Usa /start"))))
     app.add_handler(CommandHandler("mie_prenotazioni", lambda u,c: asyncio.create_task(show_my_bookings(u,c))))
     app.add_handler(CommandHandler("privacy", lambda u,c: asyncio.create_task(privacy_cmd(u,c))))
@@ -834,9 +1062,43 @@ def main():
     app.add_handler(CommandHandler("test_after_confirm", lambda u,c: asyncio.create_task(test_after_confirm_cmd(u,c))))
     app.add_handler(CommandHandler("version", lambda u,c: asyncio.create_task(version_cmd(u,c))))
     app.add_handler(CommandHandler("debug_config", lambda u,c: asyncio.create_task(debug_config_cmd(u,c))))
+    app.add_handler(CommandHandler("admin", lambda u,c: asyncio.create_task(admin_cmd(u,c))))
+    # Error handler per diagnosticare blocchi imprevisti
+    async def _err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+        logger.exception("Unhandled error", exc_info=context.error)
+    try:
+        app.add_error_handler(_err_handler)
+    except Exception:
+        pass
 
     logger.info("PrenotaFacile minimal avviato. %s", BUILD_VERSION)
     logger.info("Config: AFTER_CONFIRM=%s QUICK_TEST=%s BEFORE_APPT=%ss", REMINDER_AFTER_CONFIRM_SECONDS, REMINDER_QUICK_TEST, REMINDER_TEST_SECONDS)
+    force_webhook = os.environ.get("FORCE_WEBHOOK", "0").lower() in {"1","true","yes"}
+    if force_webhook:
+        # Avvio in webhook con ngrok (se disponibile)
+        try:
+            from pyngrok import ngrok
+            port = int(os.environ.get("WEBHOOK_PORT", "8080"))
+            # Avvia tunnel
+            public_url = os.environ.get("PUBLIC_URL")
+            if not public_url:
+                auth = os.environ.get("NGROK_AUTHTOKEN")
+                if auth:
+                    ngrok.set_auth_token(auth)
+                tunnel = ngrok.connect(port)
+                public_url = tunnel.public_url
+            webhook_url = f"{public_url}/{TOKEN}"
+            logger.info("Webhook URL: %s", webhook_url)
+            app.run_webhook(
+                listen="0.0.0.0",
+                port=port,
+                url_path=TOKEN,
+                webhook_url=webhook_url,
+                drop_pending_updates=True,
+            )
+            return
+        except Exception as e:
+            logger.warning("Falling back to polling (webhook error): %s", e)
     app.run_polling()
 
 if __name__ == "__main__":
