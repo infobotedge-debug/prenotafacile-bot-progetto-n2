@@ -43,7 +43,8 @@ def load_token() -> str:
 
 TOKEN = load_token()
 
-DB_PATH = "prenotafacile.db"
+# Usa un percorso assoluto relativo a questo file per evitare di creare DB in cartelle diverse
+DB_PATH = os.path.join(os.path.dirname(__file__), "prenotafacile.db")
 SLOT_MINUTES = 30
 REMINDER_TEST_SECONDS = 30
 try:
@@ -284,7 +285,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("👩 Donna", callback_data="gender_Donna"), InlineKeyboardButton("👨 Uomo", callback_data="gender_Uomo")],
           [InlineKeyboardButton("📆 Le mie prenotazioni", callback_data="my_bookings")],
           [InlineKeyboardButton("ℹ️ Help", callback_data="help")]]
-    await update.message.reply_text("Benvenuto in *PrenotaFacile* — scegli il profilo:", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    text = "Benvenuto in *PrenotaFacile* — scegli il profilo:"
+    try:
+        # Preferisci reply se è un normale messaggio
+        if getattr(update, "message", None):
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        else:
+            # Fallback robusto: invia al chat_id effettivo (es. se /start arriva in contesti particolari)
+            chat_id = update.effective_chat.id if getattr(update, "effective_chat", None) else (user.id if user else None)
+            if chat_id is not None:
+                await context.application.bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+            else:
+                logger.warning("/start: impossibile determinare il chat_id")
+    except Exception as e:
+        logger.exception("Failed to send /start menu: %s", e)
     return ASK_GENDER
 
 async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -502,6 +516,12 @@ async def show_calendar_month(q, context, year, month):
         InlineKeyboardButton("📅 12 mesi", callback_data=f"pickmonths_{year}_{month}"),
         InlineKeyboardButton("Mese succ. ➡️", callback_data=f"cal_{next_year}_{next_month}_next")
     ])
+    # Pulsante Indietro per tornare alla scelta operatore del servizio corrente
+    try:
+        if svc and svc.get("code"):
+            kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data=f"svc_{svc['code']}")])
+    except Exception:
+        pass
     legend_text = "Legenda: 🟢 giorno con disponibilità · 🔴 giorno pieno"
     month_name_it = ITALIAN_MONTHS[month-1]
     await q.edit_message_text(f"*{month_name_it} {year}*\n\n{legend_text}", reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
@@ -669,6 +689,40 @@ async def admin_cb_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await admin_export_impl(q, context)
         return
     await q.edit_message_text("Comando admin non riconosciuto.")
+
+async def purge_day_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando admin: /purge_day YYYY-MM-DD op_id
+
+    Esempio: /purge_day 2025-10-25 op_sara
+    Elimina tutte le prenotazioni di quella giornata per la specifica operatrice.
+    """
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("Accesso negato. ✋")
+        return
+    args = context.args if hasattr(context, "args") else []
+    if len(args) != 2:
+        await update.message.reply_text("Uso: /purge_day YYYY-MM-DD op_id\nEsempio: /purge_day 2025-10-25 op_sara")
+        return
+    date_str, op_id = args[0].strip(), args[1].strip()
+    # Valida data
+    try:
+        _ = datetime.strptime(date_str, "%Y-%m-%d")
+    except Exception:
+        await update.message.reply_text("Data non valida. Usa formato YYYY-MM-DD")
+        return
+    # Valida operatrice
+    valid_ops = {op["id"] for op in OPERATRICI}
+    if op_id not in valid_ops:
+        await update.message.reply_text("Operatrice non valida. Usa uno di: " + ", ".join(sorted(valid_ops)))
+        return
+    # Cancella
+    con = db_conn(); cur = con.cursor()
+    cur.execute("SELECT COUNT(*) FROM bookings WHERE date=? AND operator_id=?", (date_str, op_id))
+    pre = cur.fetchone()[0]
+    cur.execute("DELETE FROM bookings WHERE date=? AND operator_id=?", (date_str, op_id))
+    con.commit(); con.close()
+    await update.message.reply_text(f"Eliminate {pre} prenotazioni per {operator_name(op_id)} in data {date_str}.")
 
 async def admin_today_impl(q, context: ContextTypes.DEFAULT_TYPE):
     dstr = date.today().strftime('%Y-%m-%d')
@@ -1046,11 +1100,24 @@ def main():
     app.add_handler(CommandHandler("help", lambda u,c: asyncio.create_task(u.message.reply_text("Usa /start"))))
     app.add_handler(CommandHandler("mie_prenotazioni", lambda u,c: asyncio.create_task(show_my_bookings(u,c))))
     app.add_handler(CommandHandler("privacy", lambda u,c: asyncio.create_task(privacy_cmd(u,c))))
+    # Ping semplice per testare rapidamente la responsività
+    async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            if getattr(update, "message", None):
+                await update.message.reply_text("pong")
+            else:
+                cid = update.effective_chat.id if getattr(update, "effective_chat", None) else None
+                if cid is not None:
+                    await context.application.bot.send_message(cid, "pong")
+        except Exception:
+            logger.exception("/ping failed")
+    app.add_handler(CommandHandler("ping", lambda u,c: asyncio.create_task(ping_cmd(u,c))))
     app.add_handler(CommandHandler("test_reminder", lambda u,c: asyncio.create_task(test_reminder_cmd(u,c))))
     app.add_handler(CommandHandler("test_after_confirm", lambda u,c: asyncio.create_task(test_after_confirm_cmd(u,c))))
     app.add_handler(CommandHandler("version", lambda u,c: asyncio.create_task(version_cmd(u,c))))
     app.add_handler(CommandHandler("debug_config", lambda u,c: asyncio.create_task(debug_config_cmd(u,c))))
     app.add_handler(CommandHandler("admin", lambda u,c: asyncio.create_task(admin_cmd(u,c))))
+    app.add_handler(CommandHandler("purge_day", lambda u,c: asyncio.create_task(purge_day_cmd(u,c))))
     # Error handler per diagnosticare blocchi imprevisti
     async def _err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Unhandled error", exc_info=context.error)
