@@ -1335,10 +1335,11 @@ def FULL_show_calendar_month(year: int, month: int, op_id: str, svc_code: str) -
                     row.append(InlineKeyboardButton(label, callback_data="ignore"))
                 else:
                     label = f"[{day}]" if is_today else f"{day}"
-                    row.append(InlineKeyboardButton(label, callback_data=f"full_date_{ddate.isoformat()}_op_{op_id}_svc_{svc_code}"))
+                    # Usa callback compatto: fd_ invece di full_date_
+                    row.append(InlineKeyboardButton(label, callback_data=f"fd_{ddate.isoformat()}"))
         kb.append(row)
     
-    # Navigazione mesi
+    # Navigazione mesi - callback compatti
     prev_month = month - 1
     prev_year = year
     if prev_month < 1:
@@ -1352,9 +1353,9 @@ def FULL_show_calendar_month(year: int, month: int, op_id: str, svc_code: str) -
         next_year += 1
     
     kb.append([
-        InlineKeyboardButton("⬅️ Prec", callback_data=f"full_cal_{prev_year}_{prev_month}_op_{op_id}_svc_{svc_code}"),
+        InlineKeyboardButton("⬅️ Prec", callback_data=f"fc_{prev_year}_{prev_month}"),
         InlineKeyboardButton(f"{ITALIAN_MONTHS[month-1]} {year}", callback_data="ignore"),
-        InlineKeyboardButton("Succ ➡️", callback_data=f"full_cal_{next_year}_{next_month}_op_{op_id}_svc_{svc_code}")
+        InlineKeyboardButton("Succ ➡️", callback_data=f"fc_{next_year}_{next_month}")
     ])
     
     kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data=f"full_svc_{svc_code}")])
@@ -1473,32 +1474,79 @@ async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         op_part = parts[0]
         svc_code = parts[1]
         op_id = op_part[len("full_op_"):]
+        # Salva in context per i callback successivi
+        context.user_data["full_op_id"] = op_id
+        context.user_data["full_svc_code"] = svc_code
         # Mostra calendario grafico del mese corrente
         today = date.today()
         msg, kb = FULL_show_calendar_month(today.year, today.month, op_id, svc_code)
         await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
         return
-    # Navigazione calendario
-    if data.startswith("full_cal_") and "_op_" in data and "_svc_" in data:
-        # full_cal_YYYY_MM_op_xxx_svc_yyy
-        parts = data[len("full_cal_"):].split("_op_")
-        year_month = parts[0]
-        rest = parts[1]
-        year, month = map(int, year_month.split("_"))
-        op_id, svc_code = rest.split("_svc_")
+    # Navigazione calendario (callback compatto fc_YYYY_MM)
+    if data.startswith("fc_"):
+        # Recupera op_id e svc_code da context
+        op_id = context.user_data.get("full_op_id")
+        svc_code = context.user_data.get("full_svc_code")
+        if not op_id or not svc_code:
+            await q.edit_message_text("Sessione scaduta. Usa /start per ricominciare.")
+            return
+        parts = data[3:].split("_")
+        year, month = int(parts[0]), int(parts[1])
         msg, kb = FULL_show_calendar_month(year, month, op_id, svc_code)
         await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
         return
-    if data.startswith("full_date_") and "_op_" in data and "_svc_" in data:
-        left, rest = data.split("_op_"); date_s = left[len("full_date_"):]; op_id, svc_code = rest.split("_svc_")
-        slots = FULL_generate_slots_for_operator(op_id, date.fromisoformat(date_s)); kb = []
-        for t in slots[:8]: kb.append([InlineKeyboardButton(t, callback_data=f"full_time_{date_s}_{t}_op_{op_id}_svc_{svc_code}")])
-        await q.edit_message_text("Scegli orario:", reply_markup=InlineKeyboardMarkup(kb)); return
-    if data.startswith("full_time_") and "_op_" in data and "_svc_" in data:
-        parts = data.split("_op_"); left = parts[0][len("full_time_"):]; op_id, svc_code = parts[1].split("_svc_"); dpart, tpart = left.split("_")
-        user = update.effective_user; client_id = FULL_find_or_create_client(user.id, name=user.full_name); con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT duration_minutes FROM services WHERE code=?", (svc_code,)); svc = cur.fetchone(); duration = svc["duration_minutes"] if svc else 30;
-        if not FULL_is_slot_available(op_id, dpart, tpart): await update.callback_query.answer("Slot non più disponibile.", show_alert=True); con.close(); return
-        center_id = 1; cur.execute("SELECT id FROM centers LIMIT 1"); r = cur.fetchone(); center_id = r["id"] if r else 1; bid = FULL_add_booking(center_id, op_id, svc_code, client_id, dpart, tpart, duration); con.close(); await update.callback_query.edit_message_text(f"✅ Prenotazione confermata per il {dpart} alle {tpart}. ID: {bid}"); return
+    # Selezione data (callback compatto fd_YYYY-MM-DD)
+    if data.startswith("fd_"):
+        date_str = data[3:]  # Rimuove "fd_"
+        # Recupera op_id e svc_code da context
+        op_id = context.user_data.get("full_op_id")
+        svc_code = context.user_data.get("full_svc_code")
+        if not op_id or not svc_code:
+            await q.edit_message_text("Sessione scaduta. Usa /start per ricominciare.")
+            return
+        # Mostra gli orari disponibili
+        slots = FULL_generate_slots_for_operator(op_id, date.fromisoformat(date_str))
+        kb = []
+        for t in slots[:8]:
+            kb.append([InlineKeyboardButton(t, callback_data=f"ft_{date_str}_{t}")])
+        if not kb:
+            await q.edit_message_text("Nessun orario disponibile per questo giorno.")
+            return
+        await q.edit_message_text("Scegli orario:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    # Selezione orario (callback compatto ft_YYYY-MM-DD_HH:MM)
+    if data.startswith("ft_"):
+        parts = data[3:].split("_")
+        date_str = parts[0]
+        time_str = parts[1]
+        # Recupera op_id e svc_code da context
+        op_id = context.user_data.get("full_op_id")
+        svc_code = context.user_data.get("full_svc_code")
+        if not op_id or not svc_code:
+            await q.edit_message_text("Sessione scaduta. Usa /start per ricominciare.")
+            return
+        # Crea prenotazione
+        user = update.effective_user
+        client_id = FULL_find_or_create_client(user.id, name=user.full_name)
+        con = FULL_db_conn()
+        cur = con.cursor()
+        cur.execute("SELECT duration_minutes FROM services WHERE code=?", (svc_code,))
+        svc = cur.fetchone()
+        duration = svc["duration_minutes"] if svc else 30
+        
+        if not FULL_is_slot_available(op_id, date_str, time_str):
+            await q.answer("Slot non più disponibile.", show_alert=True)
+            con.close()
+            return
+        
+        center_id = 1
+        cur.execute("SELECT id FROM centers LIMIT 1")
+        r = cur.fetchone()
+        center_id = r["id"] if r else 1
+        bid = FULL_add_booking(center_id, op_id, svc_code, client_id, date_str, time_str, duration)
+        con.close()
+        await q.edit_message_text(f"✅ Prenotazione confermata per il {date_str} alle {time_str}. ID: {bid}")
+        return
     if data == "full_my_bookings":
         user = update.effective_user; con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM clients WHERE tg_id=?", (user.id,)); r = cur.fetchone()
         if not r: await update.callback_query.edit_message_text("Non hai prenotazioni."); con.close(); return
