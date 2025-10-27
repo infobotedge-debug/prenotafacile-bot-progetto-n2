@@ -1418,6 +1418,7 @@ async def FULL_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Variante: {variant} (MODE={mode_env})\nBuild: {FULL_BUILD_VERSION}")
 
 def FULL_build_application():
+    # Crea Application normalmente - il problema era nella versione di PTB
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", FULL_start_cmd))
     app.add_handler(CallbackQueryHandler(FULL_callback_router, pattern=r"^full_"))
@@ -1439,20 +1440,10 @@ async def FULL_main_async():
     FULL_ensure_sample_data()
     app = FULL_build_application()
     await FULL_notify_admin_startup(app)
-    # Avvia in polling senza annidare event loops
+    # Avvia in polling (PTB 20.x compatibile)
     logger.info("PrenotaFacile FULL: avvio polling...")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    try:
-        # Attendi indefinitamente finché il processo viene terminato dallo script di stop
-        await asyncio.Event().wait()
-    finally:
-        try:
-            await app.updater.stop()
-        except Exception:
-            pass
-        await app.stop()
+    # run_polling blocca e gestisce tutto internamente
+    await app.run_polling(drop_pending_updates=True)
 
 
 def main():
@@ -1462,8 +1453,32 @@ def main():
     except Exception:
         variant = "minimal"
     if variant == "full":
+        # Inizializza DB e dati
+        FULL_init_db()
+        FULL_migrate_db()
+        FULL_ensure_sample_data()
+        # Crea applicazione
+        app = FULL_build_application()
+        
+        # Avvia con gestione manuale del loop
+        async def _run_full():
+            await FULL_notify_admin_startup(app)
+            logger.info("PrenotaFacile FULL: avvio polling...")
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            # Attendi indefinitamente
+            stop_event = asyncio.Event()
+            try:
+                await stop_event.wait()
+            finally:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+        
+        # Usa asyncio.run per PTB 21+ e Python 3.13
         try:
-            asyncio.run(FULL_main_async())
+            asyncio.run(_run_full())
         except KeyboardInterrupt:
             logger.info("Arresto manuale (FULL)")
         return
