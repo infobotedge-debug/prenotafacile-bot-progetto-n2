@@ -2,9 +2,11 @@
 
 Bot Telegram per prenotazioni (demo) in italiano, con SQLite, promemoria, pannello admin ed avvio opzionale in webhook via ngrok.
 
-Sono disponibili due varianti:
-- Minimal (file `bot_completo.py`): flusso conversazionale con calendario e JobQueue.
-- Full (file `bot_full.py`): multi-centro, operatori/servizi dinamici su DB, reminder scanner, backup, report giornaliero.
+Sono disponibili due varianti in un unico file:
+- Minimal: flusso conversazionale con calendario e JobQueue.
+- Full: multi-centro, operatori/servizi dinamici su DB, reminder scanner, backup, report giornaliero.
+
+Nota: tutto è integrato in `bot_completo.py`. Il file `bot_full.py` è deprecato ed è solo uno shim che reindirizza alla modalità FULL del file unico.
 
 ## Avvio veloce
 1. Crea `token.txt` nella root con il BOT token.
@@ -13,8 +15,8 @@ Sono disponibili due varianti:
 4. Avvio in webhook (ngrok) opzionale: `powershell -ExecutionPolicy Bypass -File scripts/start_webhook.ps1`
 
 ## File principali
-- `bot_completo.py`: bot single-file (minimal) con calendario e reminder
-- `bot_full.py`: versione completa con DB normalizzato (centers/operators/services/clients/bookings), waitlist e scanner reminder
+- `bot_completo.py`: bot single-file con entrambe le varianti (Minimal/Full)
+- `bot_full.py`: DEPRECATO, shim che forza la modalità FULL di `bot_completo.py`
 - `scripts/start_polling.ps1`: avvio in polling con log
 - `scripts/start_webhook.ps1`: avvio in webhook con ngrok (URL pubblico automatico)
 - `requirements.txt`: dipendenze
@@ -59,16 +61,24 @@ Per la versione full sono disponibili anche:
 3. Verifica che arrivi il messaggio di notifica con il bottone per prenotare lo slot liberato.
 4. Se il primo utente non risponde entro X secondi, controlla che il messaggio arrivi al successivo in lista.
 
-## Come avviare la versione Full
+## Come avviare la versione Full (file unico)
 
 In PowerShell (Windows), con la virtualenv del progetto già attiva e i requisiti installati:
 
 ```powershell
-# dalla cartella del progetto
-".\.venv\Scripts\python.exe" ".\prenotafacile-bot-progetto-n2\bot_full.py"
+# dalla cartella del progetto (modalità FULL via env var)
+$env:BOT_VARIANT = "full"
+".\.venv\Scripts\python.exe" ".\prenotafacile-bot-progetto-n2\bot_completo.py"
 ```
 
 Note:
-- La full usa il DB `prenotafacile_full.db` nella stessa cartella del file `bot_full.py`.
+- La full usa il DB `prenotafacile_full.db` nella stessa cartella del file `bot_completo.py`.
 - Il token viene letto da `prenotafacile-bot-progetto-n2/token.txt` o dalla variabile d'ambiente `BOT_TOKEN`.
+
+In alternativa, per retrocompatibilità, puoi ancora eseguire lo shim:
+
+```powershell
+".\.venv\Scripts\python.exe" ".\prenotafacile-bot-progetto-n2\bot_full.py"
+```
+che internamente imposta `BOT_VARIANT=full` e lancia `bot_completo.py`.
 

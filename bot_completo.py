@@ -6,7 +6,7 @@ Dipendenze: vedi requirements.txt
 Avvio: scripts/start_polling.ps1 (Windows)
 """
 import os, calendar, sqlite3, asyncio, logging
-from io import BytesIO
+from io import BytesIO, StringIO
 import csv
 from datetime import datetime, date, time, timedelta
 from typing import List
@@ -1088,7 +1088,242 @@ async def debug_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ==============================
+# Variante FULL integrata (single file)
+# Attiva con: BOT_VARIANT=full
+# ==============================
+
+# Admin/Build per FULL
+FULL_ADMIN_CHAT_ID = int(os.environ.get("ADMIN_CHAT_ID", "1235501437"))
+FULL_ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "@Wineorange")
+FULL_BUILD_VERSION = os.getenv("GITHUB_RUN_ID", "dev-local")
+
+# DB per FULL (separato dal minimal)
+FULL_DB_PATH = os.path.join(os.path.dirname(__file__), "prenotafacile_full.db")
+
+FULL_DB_SCHEMA = """
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS centers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    timezone TEXT DEFAULT 'Europe/Rome',
+    config_json TEXT DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS operators (
+    id TEXT PRIMARY KEY,
+    center_id INTEGER,
+    name TEXT,
+    work_start TEXT,
+    work_end TEXT,
+    breaks_json TEXT DEFAULT '[]',
+    FOREIGN KEY(center_id) REFERENCES centers(id)
+);
+CREATE TABLE IF NOT EXISTS services (
+    code TEXT PRIMARY KEY,
+    center_id INTEGER,
+    title TEXT,
+    duration_minutes INTEGER,
+    price REAL,
+    FOREIGN KEY(center_id) REFERENCES centers(id)
+);
+CREATE TABLE IF NOT EXISTS clients (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id INTEGER UNIQUE,
+    name TEXT,
+    phone TEXT,
+    last_seen DATETIME
+);
+CREATE TABLE IF NOT EXISTS bookings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    center_id INTEGER,
+    operator_id TEXT,
+    service_code TEXT,
+    client_id INTEGER,
+    date TEXT,
+    time TEXT,
+    duration INTEGER,
+    status TEXT DEFAULT 'CONFIRMED',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    reminder_sent INTEGER DEFAULT 0,
+    FOREIGN KEY(center_id) REFERENCES centers(id),
+    FOREIGN KEY(operator_id) REFERENCES operators(id),
+    FOREIGN KEY(service_code) REFERENCES services(code),
+    FOREIGN KEY(client_id) REFERENCES clients(id)
+);
+CREATE TABLE IF NOT EXISTS waitlist_full (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    center_id INTEGER,
+    service_code TEXT,
+    requested_date TEXT,
+    client_id INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+"""
+
+def FULL_db_conn():
+    con = sqlite3.connect(FULL_DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    con.row_factory = sqlite3.Row
+    return con
+
+def FULL_init_db():
+    con = FULL_db_conn(); cur = con.cursor(); cur.executescript(FULL_DB_SCHEMA); con.commit(); con.close()
+
+def FULL_create_center_if_missing(name: str = "Default Centro") -> int:
+    con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM centers WHERE name=?", (name,)); r = cur.fetchone()
+    if r:
+        cid = r["id"]
+    else:
+        cur.execute("INSERT INTO centers(name) VALUES(?)", (name,)); cid = cur.lastrowid; con.commit()
+    con.close(); return cid
+
+def FULL_ensure_sample_data():
+    con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT COUNT(*) FROM centers")
+    if cur.fetchone()[0] == 0:
+        cid = FULL_create_center_if_missing("Centro Demo")
+        cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_sara", cid, "Sara", "09:00", "18:00"))
+        cur.execute("INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price) VALUES(?,?,?,?,?)", ("svc_pulizia_viso", cid, "Pulizia viso", 45, 40.0))
+        cur.execute("INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price) VALUES(?,?,?,?,?)", ("svc_manicure", cid, "Manicure", 30, 20.0))
+        con.commit(); logger.info("[FULL] Dati di demo inseriti.")
+    con.close()
+
+def FULL_parse_hhmm(s: str) -> time:
+    h, m = map(int, s.split(":")); return time(hour=h, minute=m)
+
+def FULL_generate_slots_for_operator(operator_id: str, target_date: date) -> List[str]:
+    con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT * FROM operators WHERE id=?", (operator_id,)); op = cur.fetchone()
+    if not op: con.close(); return []
+    start = FULL_parse_hhmm(op["work_start"]); end = FULL_parse_hhmm(op["work_end"])
+    slot_minutes = 30; dt_start = datetime.combine(target_date, start); dt_end = datetime.combine(target_date, end); slots = []
+    cur.execute("SELECT DISTINCT time FROM bookings WHERE operator_id=? AND date=? AND status='CONFIRMED'", (operator_id, target_date.isoformat()))
+    taken = {r["time"] for r in cur.fetchall()}; s = dt_start
+    while s + timedelta(minutes=slot_minutes) <= dt_end:
+        hhmm = s.strftime("%H:%M");
+        if hhmm not in taken: slots.append(hhmm)
+        s += timedelta(minutes=slot_minutes)
+    con.close(); return slots
+
+def FULL_is_slot_available(operator_id: str, target_date: str, time_str: str) -> bool:
+    con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT COUNT(*) FROM bookings WHERE operator_id=? AND date=? AND time=? AND status='CONFIRMED'", (operator_id, target_date, time_str)); ok = (cur.fetchone()[0] == 0); con.close(); return ok
+
+def FULL_find_or_create_client(tg_id: int, name: str | None = None, phone: str | None = None) -> int:
+    con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM clients WHERE tg_id=?", (tg_id,)); r = cur.fetchone()
+    if r:
+        cid = r["id"]; cur.execute("UPDATE clients SET last_seen=? WHERE id=?", (datetime.now(), cid))
+    else:
+        cur.execute("INSERT INTO clients(tg_id, name, phone, last_seen) VALUES(?,?,?,?)", (tg_id, name or "", phone or "", datetime.now())); cid = cur.lastrowid
+    con.commit(); con.close(); return cid
+
+def FULL_add_booking(center_id:int, operator_id:str, service_code:str, client_id:int, dstr:str, tstr:str, duration:int) -> int:
+    con = FULL_db_conn(); cur = con.cursor(); cur.execute("INSERT INTO bookings(center_id, operator_id, service_code, client_id, date, time, duration) VALUES(?,?,?,?,?,?,?)", (center_id, operator_id, service_code, client_id, dstr, tstr, duration)); bid = cur.lastrowid; con.commit(); con.close(); return bid
+
+def FULL_cancel_booking(booking_id:int) -> bool:
+    con = FULL_db_conn(); cur = con.cursor(); cur.execute("UPDATE bookings SET status='CANCELLED' WHERE id=? AND status='CONFIRMED'", (booking_id,)); ok = cur.rowcount > 0; con.commit(); con.close(); return ok
+
+async def FULL_global_error_handler(update_or_none, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("[FULL] Unhandled exception: %s", context.error)
+    try:
+        await context.bot.send_message(chat_id=FULL_ADMIN_CHAT_ID, text=f"⚠️ Errore non gestito: {context.error}")
+    except Exception:
+        pass
+
+async def FULL_notify_admin_startup(application):
+    mode_label = "🧪 TEST" if os.environ.get("MODE", "TEST").strip().upper() != "PRODUZIONE" else "🚀 PRODUZIONE"
+    msg = (
+        f"✅ *PrenotaFacile avviato (FULL)!*\n"
+        f"👤 Admin: {FULL_ADMIN_USERNAME}\n"
+        f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"🏷 Build: `{FULL_BUILD_VERSION}`\n"
+    )
+    try:
+        await application.bot.send_message(chat_id=FULL_ADMIN_CHAT_ID, text=msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+
+async def FULL_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user; FULL_find_or_create_client(user.id, name=user.full_name)
+    kb = [[InlineKeyboardButton("📅 Prenota (FULL)", callback_data="full_book_start")],[InlineKeyboardButton("📋 Le mie prenotazioni", callback_data="full_my_bookings")]]
+    await update.message.reply_text(f"Ciao {user.first_name}! Benvenuto in PrenotaFacile (FULL).", reply_markup=InlineKeyboardMarkup(kb))
+
+async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer(); data = q.data or ""
+    if data == "full_book_start":
+        con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM centers LIMIT 1"); center = cur.fetchone()
+        if not center: await q.edit_message_text("Nessun centro configurato."); con.close(); return
+        center_id = center["id"]; cur.execute("SELECT code, title, duration_minutes FROM services WHERE center_id=?", (center_id,)); services = cur.fetchall(); kb = []
+        for s in services: kb.append([InlineKeyboardButton(f"{s['title']} ({s['duration_minutes']}m)", callback_data=f"full_svc_{s['code']}")])
+        kb.append([InlineKeyboardButton("⬅️ Annulla", callback_data="full_cancel")]); await q.edit_message_text("Scegli il trattamento:", reply_markup=InlineKeyboardMarkup(kb)); con.close(); return
+    if data.startswith("full_svc_"):
+        svc_code = data.split("full_svc_")[1]; con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT * FROM operators LIMIT 5"); ops = cur.fetchall(); kb = []
+        for op in ops: kb.append([InlineKeyboardButton(f"{op['name']}", callback_data=f"full_op_{op['id']}_svc_{svc_code}")])
+        kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data="full_book_start")]); await q.edit_message_text("Scegli l'operatrice:", reply_markup=InlineKeyboardMarkup(kb)); con.close(); return
+    if data.startswith("full_op_") and "_svc_" in data:
+        parts = data.split("_svc_"); op_part = parts[0]; svc_code = parts[1]; op_id = op_part[len("full_op_"):]
+        slots_kb = []
+        for i in range(0,7):
+            d = date.today() + timedelta(days=i); slots = FULL_generate_slots_for_operator(op_id, d)
+            if slots: slots_kb.append([InlineKeyboardButton(d.strftime('%d %b'), callback_data=f"full_date_{d.isoformat()}_op_{op_id}_svc_{svc_code}")])
+        if not slots_kb:
+            await q.edit_message_text("Nessuno slot disponibile nei prossimi 7 giorni."); return
+        await q.edit_message_text("Scegli giorno:", reply_markup=InlineKeyboardMarkup(slots_kb)); return
+    if data.startswith("full_date_") and "_op_" in data and "_svc_" in data:
+        left, rest = data.split("_op_"); date_s = left[len("full_date_"):]; op_id, svc_code = rest.split("_svc_")
+        slots = FULL_generate_slots_for_operator(op_id, date.fromisoformat(date_s)); kb = []
+        for t in slots[:8]: kb.append([InlineKeyboardButton(t, callback_data=f"full_time_{date_s}_{t}_op_{op_id}_svc_{svc_code}")])
+        await q.edit_message_text("Scegli orario:", reply_markup=InlineKeyboardMarkup(kb)); return
+    if data.startswith("full_time_") and "_op_" in data and "_svc_" in data:
+        parts = data.split("_op_"); left = parts[0][len("full_time_"):]; op_id, svc_code = parts[1].split("_svc_"); dpart, tpart = left.split("_")
+        user = update.effective_user; client_id = FULL_find_or_create_client(user.id, name=user.full_name); con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT duration_minutes FROM services WHERE code=?", (svc_code,)); svc = cur.fetchone(); duration = svc["duration_minutes"] if svc else 30;
+        if not FULL_is_slot_available(op_id, dpart, tpart): await update.callback_query.answer("Slot non più disponibile.", show_alert=True); con.close(); return
+        center_id = 1; cur.execute("SELECT id FROM centers LIMIT 1"); r = cur.fetchone(); center_id = r["id"] if r else 1; bid = FULL_add_booking(center_id, op_id, svc_code, client_id, dpart, tpart, duration); con.close(); await update.callback_query.edit_message_text(f"✅ Prenotazione confermata per il {dpart} alle {tpart}. ID: {bid}"); return
+    if data == "full_my_bookings":
+        user = update.effective_user; con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM clients WHERE tg_id=?", (user.id,)); r = cur.fetchone()
+        if not r: await update.callback_query.edit_message_text("Non hai prenotazioni."); con.close(); return
+        client_id = r["id"]; cur.execute("SELECT * FROM bookings WHERE client_id=? AND status='CONFIRMED' ORDER BY date,time", (client_id,)); rows = cur.fetchall();
+        if not rows: await update.callback_query.edit_message_text("Nessuna prenotazione attiva."); con.close(); return
+        txt = "Le tue prenotazioni:\n" + "\n".join([f"- ID {b['id']}: {b['date']} {b['time']} (svc:{b['service_code']})" for b in rows]); await update.callback_query.edit_message_text(txt); con.close(); return
+    if data == "full_cancel":
+        await update.callback_query.edit_message_text("Operazione annullata. Usa /start."); return
+    await update.callback_query.answer()
+
+async def FULL_admin_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != FULL_ADMIN_CHAT_ID:
+        await update.message.reply_text("Accesso negato."); return
+    today = date.today().isoformat(); con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT * FROM bookings WHERE date=? ORDER BY time", (today,)); rows = cur.fetchall(); out = f"Prenotazioni oggi ({today}):\n" + "\n".join([f"- ID {r['id']} {r['operator_id']} {r['time']} svc:{r['service_code']} client:{r['client_id']}" for r in rows]); await update.message.reply_text(out); con.close()
+
+async def FULL_export_csv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != FULL_ADMIN_CHAT_ID:
+        await update.message.reply_text("Accesso negato."); return
+    con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT * FROM bookings ORDER BY date,time"); rows = cur.fetchall(); si = StringIO(); si.write("id,center_id,operator_id,service_code,client_id,date,time,duration,status,created_at\n");
+    for r in rows: si.write(f"{r['id']},{r['center_id']},{r['operator_id']},{r['service_code']},{r['client_id']},{r['date']},{r['time']},{r['duration']},{r['status']},{r['created_at']}\n"); si.seek(0); await update.message.reply_document(document=si.getvalue().encode("utf-8"), filename="bookings_export.csv"); con.close()
+
+def FULL_build_application():
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", FULL_start_cmd))
+    app.add_handler(CallbackQueryHandler(FULL_callback_router, pattern=r"^full_"))
+    app.add_handler(CommandHandler("admin_today", FULL_admin_today))
+    app.add_handler(CommandHandler("export_csv", FULL_export_csv_cmd))
+    try:
+        app.add_error_handler(FULL_global_error_handler)
+    except Exception:
+        pass
+    return app
+
+async def FULL_main_async():
+    FULL_init_db(); FULL_ensure_sample_data(); app = FULL_build_application(); await FULL_notify_admin_startup(app); logger.info("PrenotaFacile FULL: avvio polling..."); await app.run_polling()
+
+
 def main():
+    # Se richiesto, esegui la variante FULL integrata
+    try:
+        variant = os.environ.get("BOT_VARIANT", "minimal").strip().lower()
+    except Exception:
+        variant = "minimal"
+    if variant == "full":
+        try:
+            asyncio.run(FULL_main_async())
+        except KeyboardInterrupt:
+            logger.info("Arresto manuale (FULL)")
+        return
     init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(build_conversation())
