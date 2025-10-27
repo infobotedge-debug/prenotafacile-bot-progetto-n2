@@ -1087,6 +1087,13 @@ async def debug_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"- REMINDER_TEST_SECONDS(before appt)={REMINDER_TEST_SECONDS}"
     )
 
+async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mostra la variante attiva e info build (Minimal)."""
+    variant = os.environ.get("BOT_VARIANT", "minimal").strip().lower() or "minimal"
+    # In minimal non distinguiamo MODE, ma mostriamo comunque eventuale ENV
+    mode_env = os.environ.get("MODE", "TEST").strip().upper()
+    await update.message.reply_text(f"Variante: {variant} (MODE={mode_env})\nBuild: {BUILD_VERSION}")
+
 
 # ==============================
 # Variante FULL integrata (single file)
@@ -1296,12 +1303,35 @@ async def FULL_export_csv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT * FROM bookings ORDER BY date,time"); rows = cur.fetchall(); si = StringIO(); si.write("id,center_id,operator_id,service_code,client_id,date,time,duration,status,created_at\n");
     for r in rows: si.write(f"{r['id']},{r['center_id']},{r['operator_id']},{r['service_code']},{r['client_id']},{r['date']},{r['time']},{r['duration']},{r['status']},{r['created_at']}\n"); si.seek(0); await update.message.reply_document(document=si.getvalue().encode("utf-8"), filename="bookings_export.csv"); con.close()
 
+async def FULL_ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if getattr(update, "message", None):
+            await update.message.reply_text("pong")
+        else:
+            cid = update.effective_chat.id if getattr(update, "effective_chat", None) else None
+            if cid is not None:
+                await context.application.bot.send_message(cid, "pong")
+    except Exception:
+        logger.exception("/ping (FULL) failed")
+
+async def FULL_version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Build: {FULL_BUILD_VERSION}\npython-telegram-bot: 22.x")
+
+async def FULL_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    variant = "full"
+    mode_env = os.environ.get("MODE", "TEST").strip().upper()
+    await update.message.reply_text(f"Variante: {variant} (MODE={mode_env})\nBuild: {FULL_BUILD_VERSION}")
+
 def FULL_build_application():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", FULL_start_cmd))
     app.add_handler(CallbackQueryHandler(FULL_callback_router, pattern=r"^full_"))
     app.add_handler(CommandHandler("admin_today", FULL_admin_today))
     app.add_handler(CommandHandler("export_csv", FULL_export_csv_cmd))
+    # Allinea comandi di servizio
+    app.add_handler(CommandHandler("ping", FULL_ping_cmd))
+    app.add_handler(CommandHandler("version", FULL_version_cmd))
+    app.add_handler(CommandHandler("mode", FULL_mode_cmd))
     try:
         app.add_error_handler(FULL_global_error_handler)
     except Exception:
@@ -1367,6 +1397,7 @@ def main():
     app.add_handler(CommandHandler("test_reminder", lambda u,c: asyncio.create_task(test_reminder_cmd(u,c))))
     app.add_handler(CommandHandler("test_after_confirm", lambda u,c: asyncio.create_task(test_after_confirm_cmd(u,c))))
     app.add_handler(CommandHandler("version", lambda u,c: asyncio.create_task(version_cmd(u,c))))
+    app.add_handler(CommandHandler("mode", lambda u,c: asyncio.create_task(mode_cmd(u,c))))
     app.add_handler(CommandHandler("debug_config", lambda u,c: asyncio.create_task(debug_config_cmd(u,c))))
     app.add_handler(CommandHandler("admin", lambda u,c: asyncio.create_task(admin_cmd(u,c))))
     app.add_handler(CommandHandler("purge_day", lambda u,c: asyncio.create_task(purge_day_cmd(u,c))))
