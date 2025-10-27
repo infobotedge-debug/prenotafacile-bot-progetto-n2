@@ -1319,8 +1319,13 @@ async def FULL_main_async():
     await app.start()
     await app.updater.start_polling()
     try:
-        await app.updater.wait_until_shutdown()
+        # Attendi indefinitamente finché il processo viene terminato dallo script di stop
+        await asyncio.Event().wait()
     finally:
+        try:
+            await app.updater.stop()
+        except Exception:
+            pass
         await app.stop()
 
 
