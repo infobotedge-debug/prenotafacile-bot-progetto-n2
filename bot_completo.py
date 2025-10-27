@@ -1302,6 +1302,66 @@ def FULL_generate_slots_for_operator(operator_id: str, target_date: date) -> Lis
 def FULL_is_slot_available(operator_id: str, target_date: str, time_str: str) -> bool:
     con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT COUNT(*) FROM bookings WHERE operator_id=? AND date=? AND time=? AND status='CONFIRMED'", (operator_id, target_date, time_str)); ok = (cur.fetchone()[0] == 0); con.close(); return ok
 
+def FULL_show_calendar_month(year: int, month: int, op_id: str, svc_code: str) -> tuple[str, list]:
+    """Genera calendario grafico per un mese con disponibilità slot"""
+    calendar.setfirstweekday(calendar.MONDAY)
+    m = calendar.monthcalendar(year, month)
+    kb = []
+    
+    # Header giorni settimana
+    header = [InlineKeyboardButton(d, callback_data="ignore") for d in ITALIAN_WEEKDAYS_SHORT]
+    kb.append(header)
+    
+    today = date.today()
+    
+    # Righe del calendario
+    for week in m:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(" ", callback_data="ignore"))
+            else:
+                ddate = date(year, month, day)
+                # Controlla se ci sono slot disponibili
+                slots = FULL_generate_slots_for_operator(op_id, ddate)
+                has_slots = len(slots) > 0
+                is_today = (ddate == today)
+                is_past = ddate < today
+                
+                if is_past:
+                    row.append(InlineKeyboardButton("—", callback_data="ignore"))
+                elif not has_slots:
+                    label = f"[{day}]" if is_today else f"{day}"
+                    row.append(InlineKeyboardButton(label, callback_data="ignore"))
+                else:
+                    label = f"[{day}]" if is_today else f"{day}"
+                    row.append(InlineKeyboardButton(label, callback_data=f"full_date_{ddate.isoformat()}_op_{op_id}_svc_{svc_code}"))
+        kb.append(row)
+    
+    # Navigazione mesi
+    prev_month = month - 1
+    prev_year = year
+    if prev_month < 1:
+        prev_month = 12
+        prev_year -= 1
+    
+    next_month = month + 1
+    next_year = year
+    if next_month > 12:
+        next_month = 1
+        next_year += 1
+    
+    kb.append([
+        InlineKeyboardButton("⬅️ Prec", callback_data=f"full_cal_{prev_year}_{prev_month}_op_{op_id}_svc_{svc_code}"),
+        InlineKeyboardButton(f"{ITALIAN_MONTHS[month-1]} {year}", callback_data="ignore"),
+        InlineKeyboardButton("Succ ➡️", callback_data=f"full_cal_{next_year}_{next_month}_op_{op_id}_svc_{svc_code}")
+    ])
+    
+    kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data=f"full_svc_{svc_code}")])
+    
+    msg = f"📅 Scegli un giorno per la prenotazione\n{ITALIAN_MONTHS[month-1]} {year}"
+    return msg, kb
+
 def FULL_find_or_create_client(tg_id: int, name: str | None = None, phone: str | None = None) -> int:
     con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM clients WHERE tg_id=?", (tg_id,)); r = cur.fetchone()
     if r:
@@ -1348,12 +1408,19 @@ def FULL_category_emoji(cat: str) -> str:
     return f"{emoji} {cat}"
 
 async def FULL_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user; FULL_find_or_create_client(user.id, name=user.full_name)
+    user = update.effective_user
+    FULL_find_or_create_client(user.id, name=user.full_name)
     kb = [
-        [InlineKeyboardButton("� Donna", callback_data="full_gender_Donna"), InlineKeyboardButton("👨 Uomo", callback_data="full_gender_Uomo")],
+        [
+            InlineKeyboardButton("👩 Donna", callback_data="full_gender_Donna"),
+            InlineKeyboardButton("👨 Uomo", callback_data="full_gender_Uomo")
+        ],
         [InlineKeyboardButton("📋 Le mie prenotazioni", callback_data="full_my_bookings")],
     ]
-    await update.message.reply_text(f"Ciao {user.first_name}! Scegli un profilo per iniziare:", reply_markup=InlineKeyboardMarkup(kb))
+    await update.message.reply_text(
+        f"Ciao {user.first_name}! Scegli un profilo per iniziare:",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
 async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer(); data = q.data or ""
@@ -1402,14 +1469,26 @@ async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         for op in ops: kb.append([InlineKeyboardButton(f"{op['name']}", callback_data=f"full_op_{op['id']}_svc_{svc_code}")])
         kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data="full_book_start")]); await q.edit_message_text("Scegli l'operatrice:", reply_markup=InlineKeyboardMarkup(kb)); con.close(); return
     if data.startswith("full_op_") and "_svc_" in data:
-        parts = data.split("_svc_"); op_part = parts[0]; svc_code = parts[1]; op_id = op_part[len("full_op_"):]
-        slots_kb = []
-        for i in range(0,7):
-            d = date.today() + timedelta(days=i); slots = FULL_generate_slots_for_operator(op_id, d)
-            if slots: slots_kb.append([InlineKeyboardButton(d.strftime('%d %b'), callback_data=f"full_date_{d.isoformat()}_op_{op_id}_svc_{svc_code}")])
-        if not slots_kb:
-            await q.edit_message_text("Nessuno slot disponibile nei prossimi 7 giorni."); return
-        await q.edit_message_text("Scegli giorno:", reply_markup=InlineKeyboardMarkup(slots_kb)); return
+        parts = data.split("_svc_")
+        op_part = parts[0]
+        svc_code = parts[1]
+        op_id = op_part[len("full_op_"):]
+        # Mostra calendario grafico del mese corrente
+        today = date.today()
+        msg, kb = FULL_show_calendar_month(today.year, today.month, op_id, svc_code)
+        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+        return
+    # Navigazione calendario
+    if data.startswith("full_cal_") and "_op_" in data and "_svc_" in data:
+        # full_cal_YYYY_MM_op_xxx_svc_yyy
+        parts = data[len("full_cal_"):].split("_op_")
+        year_month = parts[0]
+        rest = parts[1]
+        year, month = map(int, year_month.split("_"))
+        op_id, svc_code = rest.split("_svc_")
+        msg, kb = FULL_show_calendar_month(year, month, op_id, svc_code)
+        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb))
+        return
     if data.startswith("full_date_") and "_op_" in data and "_svc_" in data:
         left, rest = data.split("_op_"); date_s = left[len("full_date_"):]; op_id, svc_code = rest.split("_svc_")
         slots = FULL_generate_slots_for_operator(op_id, date.fromisoformat(date_s)); kb = []
