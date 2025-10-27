@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 PrenotaFacile – Minimal
 
@@ -1206,42 +1206,81 @@ def FULL_ensure_sample_data():
     con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT COUNT(*) FROM centers")
     if cur.fetchone()[0] == 0:
         cid = FULL_create_center_if_missing("Centro Demo")
-        # Operatrici base (puoi estendere)
+        # Operatrici base
         cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_sara", cid, "Sara", "09:00", "18:00"))
         cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_giulia", cid, "Giulia", "09:00", "18:00"))
         cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_martina", cid, "Martina", "09:00", "18:00"))
-        # Servizi Donna
-        donna = "Donna"
+        
+        # Servizi Donna - Completi come nella minimal
+        Donna = "Donna"
         cur.executemany(
             "INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price, gender, category) VALUES(?,?,?,?,?,?,?)",
             [
-                ("d_viso_pulizia", cid, "Pulizia del viso", 60, 40.0, donna, "Trattamenti Viso"),
-                ("d_viso_antiage", cid, "Trattamento anti-age", 75, 60.0, donna, "Trattamenti Viso"),
-                ("d_viso_trattamento", cid, "Trattamento viso", 45, 35.0, donna, "Trattamenti Viso"),
-                ("d_unghie_semipermanente", cid, "Semipermanente mani", 60, 30.0, donna, "Unghie"),
-                ("d_unghie_refill_gel", cid, "Refill gel", 75, 40.0, donna, "Unghie"),
-                ("d_unghie_manicure", cid, "Manicure classica", 40, 20.0, donna, "Unghie"),
-                ("d_unghie_pedicure", cid, "Pedicure", 45, 25.0, donna, "Unghie"),
-                ("d_estetica_epilazione", cid, "Epilazione completa", 60, 35.0, donna, "Estetica"),
-                ("d_estetica_sopracciglia", cid, "Definizione sopracciglia", 15, 8.0, donna, "Estetica"),
-                ("d_estetica_ceretta_completa", cid, "Ceretta completa", 60, 40.0, donna, "Estetica"),
-                ("d_estetica_extension_ciglia", cid, "Extension ciglia", 90, 60.0, donna, "Estetica"),
-                ("d_massaggio_decontr", cid, "Massaggio decontratturante", 50, 50.0, donna, "Massaggi"),
-                ("d_massaggio_rilass", cid, "Massaggio rilassante", 50, 45.0, donna, "Massaggi"),
+                # Trattamenti Viso
+                ("d_viso_pulizia", cid, "Pulizia del viso", 60, 40.0, Donna, "Trattamenti Viso"),
+                ("d_viso_antiage", cid, "Trattamento anti-age", 75, 60.0, Donna, "Trattamenti Viso"),
+                ("d_viso_idratante", cid, "Trattamento viso idratante", 45, 35.0, Donna, "Trattamenti Viso"),
+                ("d_viso_purificante", cid, "Trattamento viso purificante", 50, 38.0, Donna, "Trattamenti Viso"),
+                ("d_viso_peeling", cid, "Peeling viso", 40, 42.0, Donna, "Trattamenti Viso"),
+                
+                # Unghie
+                ("d_unghie_semipermanente", cid, "Semipermanente mani", 60, 30.0, Donna, "Unghie"),
+                ("d_unghie_refill_gel", cid, "Refill gel", 75, 40.0, Donna, "Unghie"),
+                ("d_unghie_manicure", cid, "Manicure classica", 40, 20.0, Donna, "Unghie"),
+                ("d_unghie_pedicure", cid, "Pedicure", 45, 25.0, Donna, "Unghie"),
+                ("d_unghie_ricostruzione", cid, "Ricostruzione unghie", 90, 50.0, Donna, "Unghie"),
+                ("d_unghie_french", cid, "French manicure", 50, 28.0, Donna, "Unghie"),
+                
+                # Estetica
+                ("d_estetica_epilazione", cid, "Epilazione completa", 60, 35.0, Donna, "Estetica"),
+                ("d_estetica_sopracciglia", cid, "Definizione sopracciglia", 15, 8.0, Donna, "Estetica"),
+                ("d_estetica_ceretta_completa", cid, "Ceretta completa", 60, 40.0, Donna, "Estetica"),
+                ("d_estetica_ceretta_gambe", cid, "Ceretta gambe", 40, 25.0, Donna, "Estetica"),
+                ("d_estetica_ceretta_inguine", cid, "Ceretta inguine", 30, 20.0, Donna, "Estetica"),
+                ("d_estetica_extension_ciglia", cid, "Extension ciglia", 90, 60.0, Donna, "Estetica"),
+                ("d_estetica_tinta_ciglia", cid, "Tinta ciglia", 20, 15.0, Donna, "Estetica"),
+                ("d_estetica_laminazione", cid, "Laminazione ciglia", 60, 45.0, Donna, "Estetica"),
+                
+                # Massaggi
+                ("d_massaggio_decontr", cid, "Massaggio decontratturante", 50, 50.0, Donna, "Massaggi"),
+                ("d_massaggio_rilass", cid, "Massaggio rilassante", 50, 45.0, Donna, "Massaggi"),
+                ("d_massaggio_drenante", cid, "Massaggio drenante", 60, 55.0, Donna, "Massaggi"),
+                ("d_massaggio_anticellulite", cid, "Massaggio anticellulite", 60, 58.0, Donna, "Massaggi"),
+                ("d_massaggio_svedese", cid, "Massaggio svedese", 60, 52.0, Donna, "Massaggi"),
             ]
         )
-        # Servizi Uomo
+        
+        # Servizi UOMO - Completi
         uomo = "Uomo"
         cur.executemany(
             "INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price, gender, category) VALUES(?,?,?,?,?,?,?)",
             [
+                # Trattamenti Viso
                 ("u_viso_pulizia", cid, "Pulizia del viso", 60, 40.0, uomo, "Trattamenti Viso"),
                 ("u_viso_purificante", cid, "Trattamento viso purificante", 45, 35.0, uomo, "Trattamenti Viso"),
+                ("u_viso_idratante", cid, "Trattamento viso idratante", 45, 35.0, uomo, "Trattamenti Viso"),
+                ("u_viso_anti_eta", cid, "Trattamento anti-eta", 60, 48.0, uomo, "Trattamenti Viso"),
+                
+                # Unghie
+                ("u_unghie_manicure", cid, "Manicure uomo", 30, 18.0, uomo, "Unghie"),
+                ("u_unghie_pedicure", cid, "Pedicure uomo", 40, 22.0, uomo, "Unghie"),
+                
+                # Estetica
                 ("u_estetica_sopracciglia", cid, "Definizione sopracciglia", 15, 8.0, uomo, "Estetica"),
                 ("u_estetica_epilazione_schiena", cid, "Epilazione schiena", 40, 30.0, uomo, "Estetica"),
+                ("u_estetica_ceretta_petto", cid, "Ceretta petto", 30, 25.0, uomo, "Estetica"),
+                ("u_estetica_ceretta_spalle", cid, "Ceretta spalle", 25, 20.0, uomo, "Estetica"),
+                
+                # Massaggi
+                ("u_massaggio_decontr", cid, "Massaggio decontratturante", 50, 50.0, uomo, "Massaggi"),
+                ("u_massaggio_sportivo", cid, "Massaggio sportivo", 60, 55.0, uomo, "Massaggi"),
+                ("u_massaggio_rilass", cid, "Massaggio rilassante", 50, 45.0, uomo, "Massaggi"),
+                ("u_massaggio_schiena", cid, "Massaggio schiena", 40, 40.0, uomo, "Massaggi"),
+                ("u_massaggio_cervicale", cid, "Massaggio cervicale", 30, 35.0, uomo, "Massaggi"),
             ]
         )
-        con.commit(); logger.info("[FULL] Dati di demo inseriti (Donna/Uomo, categorie e servizi).")
+        con.commit()
+        logger.info("[FULL] Dati di demo inseriti (Donna/Uomo con servizi completi).")
     con.close()
 
 def FULL_parse_hhmm(s: str) -> time:
@@ -1297,6 +1336,17 @@ async def FULL_notify_admin_startup(application):
     except Exception:
         pass
 
+def FULL_category_emoji(cat: str) -> str:
+    """Mappa categoria a emoji"""
+    mapping = {
+        "Trattamenti Viso": "💆",
+        "Unghie": "💅",
+        "Estetica": "✨",
+        "Massaggi": "💆‍♀️"
+    }
+    emoji = mapping.get(cat, "📋")
+    return f"{emoji} {cat}"
+
 async def FULL_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user; FULL_find_or_create_client(user.id, name=user.full_name)
     kb = [
@@ -1316,9 +1366,11 @@ async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         center_id = center["id"]
         cur.execute("SELECT DISTINCT category FROM services WHERE center_id=? AND gender=? ORDER BY category", (center_id, gender))
         cats = [r[0] for r in cur.fetchall()]
-        kb = [[InlineKeyboardButton(cat, callback_data=f"full_cat_{gender}|{cat}")] for cat in cats]
+        # Aggiungi emoji alle categorie
+        kb = [[InlineKeyboardButton(FULL_category_emoji(cat), callback_data=f"full_cat_{gender}|{cat}")] for cat in cats]
         kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data="full_home")])
-        await q.edit_message_text(f"Profilo: {gender}\nScegli una categoria:", reply_markup=InlineKeyboardMarkup(kb))
+        gender_emoji = "👩" if gender == "Donna" else "👨"
+        await q.edit_message_text(f"Profilo: {gender_emoji} {gender}\nScegli una categoria:", reply_markup=InlineKeyboardMarkup(kb))
         con.close(); return
     # Selezione categoria → servizi
     if data.startswith("full_cat_"):
