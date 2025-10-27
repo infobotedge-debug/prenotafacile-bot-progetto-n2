@@ -1,6 +1,10 @@
-# PrenotaFacile (minimal)
+# PrenotaFacile (minimal + full)
 
 Bot Telegram per prenotazioni (demo) in italiano, con SQLite, promemoria, pannello admin ed avvio opzionale in webhook via ngrok.
+
+Sono disponibili due varianti:
+- Minimal (file `bot_completo.py`): flusso conversazionale con calendario e JobQueue.
+- Full (file `bot_full.py`): multi-centro, operatori/servizi dinamici su DB, reminder scanner, backup, report giornaliero.
 
 ## Avvio veloce
 1. Crea `token.txt` nella root con il BOT token.
@@ -9,7 +13,8 @@ Bot Telegram per prenotazioni (demo) in italiano, con SQLite, promemoria, pannel
 4. Avvio in webhook (ngrok) opzionale: `powershell -ExecutionPolicy Bypass -File scripts/start_webhook.ps1`
 
 ## File principali
-- `bot_completo.py`: bot single-file con calendario e reminder
+- `bot_completo.py`: bot single-file (minimal) con calendario e reminder
+- `bot_full.py`: versione completa con DB normalizzato (centers/operators/services/clients/bookings), waitlist e scanner reminder
 - `scripts/start_polling.ps1`: avvio in polling con log
 - `scripts/start_webhook.ps1`: avvio in webhook con ngrok (URL pubblico automatico)
 - `requirements.txt`: dipendenze
@@ -23,6 +28,10 @@ Bot Telegram per prenotazioni (demo) in italiano, con SQLite, promemoria, pannel
 	- `/admin` apre il pannello admin (statistiche e bottoni)
 	- Bottoni: "📄 Esporta CSV" e "📅 Prenotazioni di oggi"
 	- Le prenotazioni si possono comunque disdire dagli utenti dal menu "Le mie prenotazioni"
+
+Per la versione full sono disponibili anche:
+- `/admin_today` per riepilogo prenotazioni del giorno
+- `/export_csv` per esportare le prenotazioni in CSV
 
 ## Lista d'attesa (waitlist)
 - Quando un giorno è pieno, il bot propone "🕰️ Entra in lista d'attesa".
@@ -49,4 +58,17 @@ Bot Telegram per prenotazioni (demo) in italiano, con SQLite, promemoria, pannel
 2. Cancella una prenotazione esistente dal comando interno (se presente) o dal menu dedicato.
 3. Verifica che arrivi il messaggio di notifica con il bottone per prenotare lo slot liberato.
 4. Se il primo utente non risponde entro X secondi, controlla che il messaggio arrivi al successivo in lista.
+
+## Come avviare la versione Full
+
+In PowerShell (Windows), con la virtualenv del progetto già attiva e i requisiti installati:
+
+```powershell
+# dalla cartella del progetto
+".\.venv\Scripts\python.exe" ".\prenotafacile-bot-progetto-n2\bot_full.py"
+```
+
+Note:
+- La full usa il DB `prenotafacile_full.db` nella stessa cartella del file `bot_full.py`.
+- Il token viene letto da `prenotafacile-bot-progetto-n2/token.txt` o dalla variabile d'ambiente `BOT_TOKEN`.
 
