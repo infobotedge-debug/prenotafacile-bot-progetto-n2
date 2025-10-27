@@ -1131,6 +1131,8 @@ CREATE TABLE IF NOT EXISTS services (
     title TEXT,
     duration_minutes INTEGER,
     price REAL,
+    gender TEXT DEFAULT 'Donna',
+    category TEXT DEFAULT 'Generale',
     FOREIGN KEY(center_id) REFERENCES centers(id)
 );
 CREATE TABLE IF NOT EXISTS clients (
@@ -1175,6 +1177,23 @@ def FULL_db_conn():
 def FULL_init_db():
     con = FULL_db_conn(); cur = con.cursor(); cur.executescript(FULL_DB_SCHEMA); con.commit(); con.close()
 
+def FULL_migrate_db():
+    """Esegue migrazioni minime: aggiunge colonne missing su services (gender, category)."""
+    con = FULL_db_conn(); cur = con.cursor()
+    cur.execute("PRAGMA table_info(services)")
+    cols = {row[1] for row in cur.fetchall()}  # name is index 1
+    if "gender" not in cols:
+        try:
+            cur.execute("ALTER TABLE services ADD COLUMN gender TEXT DEFAULT 'Donna'")
+        except Exception:
+            pass
+    if "category" not in cols:
+        try:
+            cur.execute("ALTER TABLE services ADD COLUMN category TEXT DEFAULT 'Generale'")
+        except Exception:
+            pass
+    con.commit(); con.close()
+
 def FULL_create_center_if_missing(name: str = "Default Centro") -> int:
     con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM centers WHERE name=?", (name,)); r = cur.fetchone()
     if r:
@@ -1187,10 +1206,42 @@ def FULL_ensure_sample_data():
     con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT COUNT(*) FROM centers")
     if cur.fetchone()[0] == 0:
         cid = FULL_create_center_if_missing("Centro Demo")
+        # Operatrici base (puoi estendere)
         cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_sara", cid, "Sara", "09:00", "18:00"))
-        cur.execute("INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price) VALUES(?,?,?,?,?)", ("svc_pulizia_viso", cid, "Pulizia viso", 45, 40.0))
-        cur.execute("INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price) VALUES(?,?,?,?,?)", ("svc_manicure", cid, "Manicure", 30, 20.0))
-        con.commit(); logger.info("[FULL] Dati di demo inseriti.")
+        cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_giulia", cid, "Giulia", "09:00", "18:00"))
+        cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_martina", cid, "Martina", "09:00", "18:00"))
+        # Servizi Donna
+        donna = "Donna"
+        cur.executemany(
+            "INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price, gender, category) VALUES(?,?,?,?,?,?,?)",
+            [
+                ("d_viso_pulizia", cid, "Pulizia del viso", 60, 40.0, donna, "Trattamenti Viso"),
+                ("d_viso_antiage", cid, "Trattamento anti-age", 75, 60.0, donna, "Trattamenti Viso"),
+                ("d_viso_trattamento", cid, "Trattamento viso", 45, 35.0, donna, "Trattamenti Viso"),
+                ("d_unghie_semipermanente", cid, "Semipermanente mani", 60, 30.0, donna, "Unghie"),
+                ("d_unghie_refill_gel", cid, "Refill gel", 75, 40.0, donna, "Unghie"),
+                ("d_unghie_manicure", cid, "Manicure classica", 40, 20.0, donna, "Unghie"),
+                ("d_unghie_pedicure", cid, "Pedicure", 45, 25.0, donna, "Unghie"),
+                ("d_estetica_epilazione", cid, "Epilazione completa", 60, 35.0, donna, "Estetica"),
+                ("d_estetica_sopracciglia", cid, "Definizione sopracciglia", 15, 8.0, donna, "Estetica"),
+                ("d_estetica_ceretta_completa", cid, "Ceretta completa", 60, 40.0, donna, "Estetica"),
+                ("d_estetica_extension_ciglia", cid, "Extension ciglia", 90, 60.0, donna, "Estetica"),
+                ("d_massaggio_decontr", cid, "Massaggio decontratturante", 50, 50.0, donna, "Massaggi"),
+                ("d_massaggio_rilass", cid, "Massaggio rilassante", 50, 45.0, donna, "Massaggi"),
+            ]
+        )
+        # Servizi Uomo
+        uomo = "Uomo"
+        cur.executemany(
+            "INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price, gender, category) VALUES(?,?,?,?,?,?,?)",
+            [
+                ("u_viso_pulizia", cid, "Pulizia del viso", 60, 40.0, uomo, "Trattamenti Viso"),
+                ("u_viso_purificante", cid, "Trattamento viso purificante", 45, 35.0, uomo, "Trattamenti Viso"),
+                ("u_estetica_sopracciglia", cid, "Definizione sopracciglia", 15, 8.0, uomo, "Estetica"),
+                ("u_estetica_epilazione_schiena", cid, "Epilazione schiena", 40, 30.0, uomo, "Estetica"),
+            ]
+        )
+        con.commit(); logger.info("[FULL] Dati di demo inseriti (Donna/Uomo, categorie e servizi).")
     con.close()
 
 def FULL_parse_hhmm(s: str) -> time:
@@ -1248,17 +1299,52 @@ async def FULL_notify_admin_startup(application):
 
 async def FULL_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user; FULL_find_or_create_client(user.id, name=user.full_name)
-    kb = [[InlineKeyboardButton("📅 Prenota (FULL)", callback_data="full_book_start")],[InlineKeyboardButton("📋 Le mie prenotazioni", callback_data="full_my_bookings")]]
-    await update.message.reply_text(f"Ciao {user.first_name}! Benvenuto in PrenotaFacile (FULL).", reply_markup=InlineKeyboardMarkup(kb))
+    kb = [
+        [InlineKeyboardButton("� Donna", callback_data="full_gender_Donna"), InlineKeyboardButton("👨 Uomo", callback_data="full_gender_Uomo")],
+        [InlineKeyboardButton("📋 Le mie prenotazioni", callback_data="full_my_bookings")],
+    ]
+    await update.message.reply_text(f"Ciao {user.first_name}! Scegli un profilo per iniziare:", reply_markup=InlineKeyboardMarkup(kb))
 
 async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer(); data = q.data or ""
-    if data == "full_book_start":
+    # Selezione profilo: Donna/Uomo
+    if data.startswith("full_gender_"):
+        gender = data.split("full_gender_")[1]
         con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM centers LIMIT 1"); center = cur.fetchone()
-        if not center: await q.edit_message_text("Nessun centro configurato."); con.close(); return
-        center_id = center["id"]; cur.execute("SELECT code, title, duration_minutes FROM services WHERE center_id=?", (center_id,)); services = cur.fetchall(); kb = []
-        for s in services: kb.append([InlineKeyboardButton(f"{s['title']} ({s['duration_minutes']}m)", callback_data=f"full_svc_{s['code']}")])
-        kb.append([InlineKeyboardButton("⬅️ Annulla", callback_data="full_cancel")]); await q.edit_message_text("Scegli il trattamento:", reply_markup=InlineKeyboardMarkup(kb)); con.close(); return
+        if not center:
+            await q.edit_message_text("Nessun centro configurato."); con.close(); return
+        center_id = center["id"]
+        cur.execute("SELECT DISTINCT category FROM services WHERE center_id=? AND gender=? ORDER BY category", (center_id, gender))
+        cats = [r[0] for r in cur.fetchall()]
+        kb = [[InlineKeyboardButton(cat, callback_data=f"full_cat_{gender}|{cat}")] for cat in cats]
+        kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data="full_home")])
+        await q.edit_message_text(f"Profilo: {gender}\nScegli una categoria:", reply_markup=InlineKeyboardMarkup(kb))
+        con.close(); return
+    # Selezione categoria → servizi
+    if data.startswith("full_cat_"):
+        payload = data[len("full_cat_"):]
+        if "|" not in payload:
+            await q.edit_message_text("Categoria non valida."); return
+        gender, category = payload.split("|", 1)
+        con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM centers LIMIT 1"); center = cur.fetchone()
+        if not center:
+            await q.edit_message_text("Nessun centro configurato."); con.close(); return
+        center_id = center["id"]
+        cur.execute(
+            "SELECT code, title, duration_minutes FROM services WHERE center_id=? AND gender=? AND category=? ORDER BY title",
+            (center_id, gender, category)
+        )
+        services = cur.fetchall(); kb = []
+        for s in services:
+            kb.append([InlineKeyboardButton(f"{s['title']} ({s['duration_minutes']}m)", callback_data=f"full_svc_{s['code']}")])
+        kb.append([InlineKeyboardButton("⬅️ Indietro", callback_data=f"full_gender_{gender}")])
+        await q.edit_message_text("Scegli un trattamento:", reply_markup=InlineKeyboardMarkup(kb)); con.close(); return
+    if data == "full_home":
+        kb = [
+            [InlineKeyboardButton("👩 Donna", callback_data="full_gender_Donna"), InlineKeyboardButton("👨 Uomo", callback_data="full_gender_Uomo")],
+            [InlineKeyboardButton("📋 Le mie prenotazioni", callback_data="full_my_bookings")],
+        ]
+        await q.edit_message_text("Menu principale:", reply_markup=InlineKeyboardMarkup(kb)); return
     if data.startswith("full_svc_"):
         svc_code = data.split("full_svc_")[1]; con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT * FROM operators LIMIT 5"); ops = cur.fetchall(); kb = []
         for op in ops: kb.append([InlineKeyboardButton(f"{op['name']}", callback_data=f"full_op_{op['id']}_svc_{svc_code}")])
@@ -1285,9 +1371,18 @@ async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
     if data == "full_my_bookings":
         user = update.effective_user; con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM clients WHERE tg_id=?", (user.id,)); r = cur.fetchone()
         if not r: await update.callback_query.edit_message_text("Non hai prenotazioni."); con.close(); return
-        client_id = r["id"]; cur.execute("SELECT * FROM bookings WHERE client_id=? AND status='CONFIRMED' ORDER BY date,time", (client_id,)); rows = cur.fetchall();
+        client_id = r["id"]
+        cur.execute(
+            "SELECT b.id,b.date,b.time,b.service_code,s.title FROM bookings b LEFT JOIN services s ON b.service_code=s.code WHERE b.client_id=? AND b.status='CONFIRMED' ORDER BY b.date,b.time",
+            (client_id,)
+        ); rows = cur.fetchall()
         if not rows: await update.callback_query.edit_message_text("Nessuna prenotazione attiva."); con.close(); return
-        txt = "Le tue prenotazioni:\n" + "\n".join([f"- ID {b['id']}: {b['date']} {b['time']} (svc:{b['service_code']})" for b in rows]); await update.callback_query.edit_message_text(txt); con.close(); return
+        out_lines = []
+        for b in rows:
+            title = b["title"] if b["title"] else b["service_code"]
+            out_lines.append(f"- ID {b['id']}: {b['date']} {b['time']} – {title}")
+        txt = "Le tue prenotazioni:\n" + "\n".join(out_lines)
+        await update.callback_query.edit_message_text(txt); con.close(); return
     if data == "full_cancel":
         await update.callback_query.edit_message_text("Operazione annullata. Usa /start."); return
     await update.callback_query.answer()
@@ -1340,6 +1435,7 @@ def FULL_build_application():
 
 async def FULL_main_async():
     FULL_init_db()
+    FULL_migrate_db()
     FULL_ensure_sample_data()
     app = FULL_build_application()
     await FULL_notify_admin_startup(app)
