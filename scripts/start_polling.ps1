@@ -1,5 +1,7 @@
 param(
-    [string]$BotToken = $env:BOT_TOKEN
+    [string]$BotToken = $env:BOT_TOKEN,
+    [ValidateSet('minimal','full')]
+    [string]$Variant = $env:BOT_VARIANT
 )
 $ErrorActionPreference = 'Stop'
 
@@ -23,6 +25,10 @@ if (-not $BotToken) {
 if (-not $BotToken) { Write-Error 'Imposta $env:BOT_TOKEN o crea ..\token.txt'; exit 1 }
 $env:BOT_TOKEN = $BotToken
 $env:FORCE_WEBHOOK = '0'
+
+# Variante bot (minimal|full). Default minimal se non specificata
+if (-not $Variant) { $Variant = 'minimal' }
+$env:BOT_VARIANT = $Variant
 
 # Assicura un virtualenv locale con le dipendenze giuste
 $venvPath = Resolve-Path -LiteralPath '..\.venv' -ErrorAction SilentlyContinue
