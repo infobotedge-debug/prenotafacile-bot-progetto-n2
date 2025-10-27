@@ -1309,7 +1309,19 @@ def FULL_build_application():
     return app
 
 async def FULL_main_async():
-    FULL_init_db(); FULL_ensure_sample_data(); app = FULL_build_application(); await FULL_notify_admin_startup(app); logger.info("PrenotaFacile FULL: avvio polling..."); await app.run_polling()
+    FULL_init_db()
+    FULL_ensure_sample_data()
+    app = FULL_build_application()
+    await FULL_notify_admin_startup(app)
+    # Avvia in polling senza annidare event loops
+    logger.info("PrenotaFacile FULL: avvio polling...")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    try:
+        await app.updater.wait_until_shutdown()
+    finally:
+        await app.stop()
 
 
 def main():
