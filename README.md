@@ -6,7 +6,7 @@ Sono disponibili due varianti in un unico file:
 - Minimal: flusso conversazionale con calendario e JobQueue.
 - Full: multi-centro, operatori/servizi dinamici su DB, reminder scanner, backup, report giornaliero.
 
-Nota: tutto è integrato in `bot_completo.py`. Il file `bot_full.py` è deprecato ed è solo uno shim che reindirizza alla modalità FULL del file unico.
+Nota: tutto è integrato in `bot_completo.py`. Il progetto usa un solo file bot.
 
 ## Avvio veloce
 1. Crea `token.txt` nella root con il BOT token.
@@ -16,7 +16,6 @@ Nota: tutto è integrato in `bot_completo.py`. Il file `bot_full.py` è deprecat
 
 ## File principali
 - `bot_completo.py`: bot single-file con entrambe le varianti (Minimal/Full)
-- `bot_full.py`: DEPRECATO, shim che forza la modalità FULL di `bot_completo.py`
 - `scripts/start_polling.ps1`: avvio in polling con log
 - `scripts/start_webhook.ps1`: avvio in webhook con ngrok (URL pubblico automatico)
 - `requirements.txt`: dipendenze
@@ -75,10 +74,9 @@ Note:
 - La full usa il DB `prenotafacile_full.db` nella stessa cartella del file `bot_completo.py`.
 - Il token viene letto da `prenotafacile-bot-progetto-n2/token.txt` o dalla variabile d'ambiente `BOT_TOKEN`.
 
-In alternativa, per retrocompatibilità, puoi ancora eseguire lo shim:
+In alternativa, puoi impostare la variante direttamente nello script di avvio:
 
 ```powershell
-".\.venv\Scripts\python.exe" ".\prenotafacile-bot-progetto-n2\bot_full.py"
+.\n+\prenotafacile-bot-progetto-n2\scripts\start_polling.ps1 -Variant full
 ```
-che internamente imposta `BOT_VARIANT=full` e lancia `bot_completo.py`.
 
