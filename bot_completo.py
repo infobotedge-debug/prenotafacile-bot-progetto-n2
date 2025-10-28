@@ -2075,7 +2075,7 @@ def FULL_build_application():
     # Crea Application normalmente - il problema era nella versione di PTB
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", FULL_start_cmd))
-    app.add_handler(CallbackQueryHandler(FULL_callback_router, pattern=r"^full_"))
+    app.add_handler(CallbackQueryHandler(FULL_callback_router, pattern=r"^(full_|fd_|fc_|ft_)"))
     app.add_handler(CommandHandler("admin_today", FULL_admin_today))
     app.add_handler(CommandHandler("export_csv", FULL_export_csv_cmd))
     # Allinea comandi di servizio
