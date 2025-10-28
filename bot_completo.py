@@ -663,45 +663,58 @@ async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
     if data.startswith("time_"):
         time_str = data.split("_",1)[1]; context.user_data["time"] = time_str
         await q.edit_message_text("Perfetto. Inserisci *Nome e Cognome*:", parse_mode=ParseMode.MARKDOWN); return ASK_NAME
-    if data.startswith("accept_slot_"):
-        payload = data[len("accept_slot_"):]
-        # Nuovo formato con separatore sicuro '|': date|time|op_id|svc_code
-        if "|" in payload:
-            try:
-                date_str, time_str, op_id, svc_code = payload.split("|", 3)
-            except Exception:
-                await q.edit_message_text("Dati slot non validi."); return
+    if data.startswith("acsl_") or data.startswith("accept_slot_"):
+        # Nuovo formato compatto: acsl_YYYYMMDD|HH:MM|op_compact|svc_compact
+        if data.startswith("acsl_"):
+            # Recupera dati completi da bot_data
+            if hasattr(context, 'bot_data') and data in context.bot_data:
+                slot_data = context.bot_data[data]
+                date_str = slot_data['date']
+                time_str = slot_data['time']
+                op_id = slot_data['op_id']
+                svc_code = slot_data['svc_code']
+            else:
+                await q.edit_message_text("⚠️ Slot scaduto o non disponibile."); return
         else:
-            # Back-compat: vecchio formato con '_' che collide con i campi
-            try:
-                if len(payload) < 17 or payload[10] != '_' or payload[16] != '_':
-                    raise ValueError("payload legacy malformato")
-                date_str = payload[:10]
-                time_str = payload[11:16]
-                rest = payload[17:]
-                # rest = f"{op_id}_{svc_code}" ma entrambi possono contenere '_'
-                # Ricava svc_code facendo match con i codici esistenti (scegli il più lungo)
-                svc_code = None
-                op_id = None
-                svc_codes = []
-                for _, cats in SERVIZI.items():
-                    for cat_items in cats.values():
-                        for s in cat_items:
-                            svc_codes.append(s["code"])
-                best = None
-                for code in svc_codes:
-                    if rest.endswith(code) and (best is None or len(code) > len(best)):
-                        best = code
-                if best is None:
-                    raise ValueError("svc_code non riconosciuto nel payload legacy")
-                svc_code = best
-                # Rimuovi separatore '_' tra op_id e svc_code se presente
-                op_part_len = len(rest) - len(svc_code)
-                op_id = rest[:max(0, op_part_len - 1)] if op_part_len > 0 and rest[op_part_len-1] == '_' else rest[:op_part_len]
-                if not op_id:
-                    raise ValueError("op_id vuoto nel payload legacy")
-            except Exception:
-                await q.edit_message_text("Dati slot non validi."); return
+            # Vecchio formato: accept_slot_date|time|op_id|svc_code
+            payload = data[len("accept_slot_"):]
+            # Nuovo formato con separatore sicuro '|': date|time|op_id|svc_code
+            if "|" in payload:
+                try:
+                    date_str, time_str, op_id, svc_code = payload.split("|", 3)
+                except Exception:
+                    await q.edit_message_text("Dati slot non validi."); return
+            else:
+                # Back-compat: vecchio formato con '_' che collide con i campi
+                try:
+                    if len(payload) < 17 or payload[10] != '_' or payload[16] != '_':
+                        raise ValueError("payload legacy malformato")
+                    date_str = payload[:10]
+                    time_str = payload[11:16]
+                    rest = payload[17:]
+                    # rest = f"{op_id}_{svc_code}" ma entrambi possono contenere '_'
+                    # Ricava svc_code facendo match con i codici esistenti (scegli il più lungo)
+                    svc_code = None
+                    op_id = None
+                    svc_codes = []
+                    for _, cats in SERVIZI.items():
+                        for cat_items in cats.values():
+                            for s in cat_items:
+                                svc_codes.append(s["code"])
+                    best = None
+                    for code in svc_codes:
+                        if rest.endswith(code) and (best is None or len(code) > len(best)):
+                            best = code
+                    if best is None:
+                        raise ValueError("svc_code non riconosciuto nel payload legacy")
+                    svc_code = best
+                    # Rimuovi separatore '_' tra op_id e svc_code se presente
+                    op_part_len = len(rest) - len(svc_code)
+                    op_id = rest[:max(0, op_part_len - 1)] if op_part_len > 0 and rest[op_part_len-1] == '_' else rest[:op_part_len]
+                    if not op_id:
+                        raise ValueError("op_id vuoto nel payload legacy")
+                except Exception:
+                    await q.edit_message_text("Dati slot non validi."); return
         svc = find_service_by_code(svc_code)
         if not svc: await q.edit_message_text("Servizio non valido."); return
         if is_slot_free_for_operator(date_str, time_str, svc["durata"], op_id):
@@ -998,6 +1011,62 @@ async def admin_export_impl(q, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
+async def process_waitlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando admin: /process_waitlist
+    Processa manualmente la waitlist cercando slot liberi per le persone in lista d'attesa.
+    """
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("⛔ Accesso negato.")
+        return
+    
+    con = db_conn(); cur = con.cursor()
+    # Trova tutte le richieste in waitlist
+    cur.execute("""
+        SELECT DISTINCT w.date, w.service_code, s.title, s.duration_minutes
+        FROM waitlist w
+        LEFT JOIN services s ON w.service_code = s.code
+        ORDER BY w.date, w.service_code
+    """)
+    waitlist_items = cur.fetchall()
+    con.close()
+    
+    if not waitlist_items:
+        await update.message.reply_text("✅ Nessuno in lista d'attesa.")
+        return
+    
+    processed = 0
+    notified = 0
+    
+    for date_str, svc_code, svc_name, duration in waitlist_items:
+        if not svc_name:  # servizio non trovato
+            continue
+            
+        # Cerca tutti gli operatori
+        con = db_conn(); cur = con.cursor()
+        cur.execute("SELECT id FROM operators")
+        operators = [r[0] for r in cur.fetchall()]
+        con.close()
+        
+        # Per ogni operatore, cerca slot liberi
+        for op_id in operators:
+            target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+            slots = free_slots_for_operator(target_date, duration, op_id)
+            for time_str in slots:
+                # Slot libero trovato! Notifica la waitlist
+                await notify_waitlist(context, date_str, time_str, op_id, svc_code, svc_name or "Servizio")
+                notified += 1
+                processed += 1
+                break  # Passa al prossimo servizio/data
+            if processed > notified - 1:
+                break  # Trovato slot per questo servizio/data
+    
+    await update.message.reply_text(
+        f"✅ Processamento completato!\n"
+        f"• Richieste elaborate: {len(waitlist_items)}\n"
+        f"• Notifiche inviate: {notified}"
+    )
+
 # Operatrici
 
 def operator_name(op_id: str) -> str:
@@ -1119,7 +1188,11 @@ async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAU
 async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE, booking_id: int):
     q = update.callback_query; con = db_conn(); cur = con.cursor(); cur.execute("SELECT user_id, service_code, service_name, date, time, operator_id FROM bookings WHERE id= ?", (booking_id,)); row = cur.fetchone()
     if not row: await q.edit_message_text("Prenotazione non trovata."); con.close(); return
-    user_id_db, svc_code, svc_name, date_str, time_str, op_id = row; cur.execute("DELETE FROM bookings WHERE id=?", (booking_id,)); con.commit(); con.close(); await q.edit_message_text("✅ Prenotazione disdetta."); await notify_waitlist(context, date_str, time_str, op_id, svc_code, svc_name)
+    user_id_db, svc_code, svc_name, date_str, time_str, op_id = row
+    logger.info(f"Canceling booking {booking_id}: service={svc_code} date={date_str} time={time_str} op={op_id}")
+    cur.execute("DELETE FROM bookings WHERE id=?", (booking_id,)); con.commit(); con.close()
+    await q.edit_message_text("✅ Prenotazione disdetta.")
+    await notify_waitlist(context, date_str, time_str, op_id, svc_code, svc_name)
 
 async def notify_waitlist(context: ContextTypes.DEFAULT_TYPE, date_str: str, time_str: str, op_id: str, svc_code: str, svc_name: str):
     """Avvia la notifica sequenziale agli utenti della lista d'attesa."""
@@ -1127,6 +1200,7 @@ async def notify_waitlist(context: ContextTypes.DEFAULT_TYPE, date_str: str, tim
     cur.execute("SELECT DISTINCT user_id FROM waitlist WHERE date=? AND service_code=? ORDER BY id ASC", (date_str, svc_code))
     users = [r[0] for r in cur.fetchall()]
     con.close()
+    logger.info(f"Waitlist check: date={date_str} service={svc_code} -> {len(users)} users found")
     if not users:
         return
     # Primo step immediato
@@ -1162,16 +1236,36 @@ async def waitlist_step_job(context: ContextTypes.DEFAULT_TYPE):
     if not is_slot_free_for_operator(date_str, time_str, svc["durata"], op_id):
         return
     uid = users[idx]
+    # Escape caratteri speciali Markdown nel nome servizio
+    svc_name_escaped = svc_name.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]')
     text = (
-        f"ℹ️ Si è liberato uno slot per *{svc_name}*\n"
+        f"ℹ️ Si è liberato uno slot per *{svc_name_escaped}*\n"
         f"📅 {datetime.strptime(date_str, '%Y-%m-%d').strftime('%d/%m/%Y')} 🕒 {time_str}\n\n"
         "Premi il bottone per prenotarlo ora (primo che conferma lo ottiene).\n"
         f"⏳ Hai {WAITLIST_STEP_SECONDS} secondi prima che venga proposto al prossimo."
     )
-    # Usa '|' come separatore per evitare collisioni con '_' nei codici
-    kb = [[InlineKeyboardButton("📌 Prenota questo slot", callback_data=f"accept_slot_{date_str}|{time_str}|{op_id}|{svc_code}")]]
+    # Callback compatto: formato YYYYMMDD|HH:MM|op_id_corto|svc_code_corto  
+    # Estrae solo le cifre da op_id e abbrevia date
+    date_compact = date_str.replace('-', '')  # 20251029
+    op_compact = op_id.replace('op_', '')  # sara, giulia, martina
+    # Usa solo prime lettere del service code per abbreviare
+    svc_parts = svc_code.split('_')
+    svc_compact = svc_parts[0][0] + '_' + '_'.join(p[:3] for p in svc_parts[1:]) if len(svc_parts) > 1 else svc_code[:10]
+    callback_str = f"acsl_{date_compact}|{time_str}|{op_compact}|{svc_compact}"
+    # Salva temporaneamente in context.bot_data per recuperare i dati completi quando viene cliccato
+    if not hasattr(context, 'bot_data'):
+        context.bot_data = {}
+    context.bot_data[callback_str] = {
+        'date': date_str,
+        'time': time_str,
+        'op_id': op_id,
+        'svc_code': svc_code
+    }
+    kb = [[InlineKeyboardButton("📌 Prenota questo slot", callback_data=callback_str)]]
     try:
         await context.application.bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        logger.error(f"Failed to send waitlist notification to user={uid}: {e}")
     except Exception as e:
         logger.debug("Invio notifica waitlist fallito per user=%s: %s", uid, e)
     # Pianifica il prossimo utente se resta libero
@@ -1211,8 +1305,10 @@ async def notify_waitlist_slot_taken(context: ContextTypes.DEFAULT_TYPE, date_st
     con.close()
     if not others:
         return
+    # Escape caratteri speciali Markdown nel nome servizio
+    svc_name_escaped = svc_name.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]')
     msg = (
-        f"❕ Lo slot per *{svc_name}* del {datetime.strptime(date_str, '%Y-%m-%d').strftime('%d/%m/%Y')} alle {time_str} è stato prenotato da un altro utente.\n"
+        f"❕ Lo slot per *{svc_name_escaped}* del {datetime.strptime(date_str, '%Y-%m-%d').strftime('%d/%m/%Y')} alle {time_str} è stato prenotato da un altro utente.\n"
         "Resterai in lista d'attesa e ti avviseremo se se ne libera un altro."
     )
     for uid in others:
@@ -2047,7 +2143,7 @@ def main():
     app.add_handler(build_conversation())
     app.add_handler(CallbackQueryHandler(confirm_router, pattern=r"^confirm_(yes|no)$"))
     # Catch-all di sicurezza per i principali callback se uscissi dalla Conversation
-    app.add_handler(CallbackQueryHandler(menu_callback_router, pattern=r"^(gender_|cat_|svc_|op_|cal_|pickmonths_|day_|time_|waitlist_join|accept_slot_|cancel_)"))
+    app.add_handler(CallbackQueryHandler(menu_callback_router, pattern=r"^(gender_|cat_|svc_|op_|cal_|pickmonths_|day_|time_|waitlist_join|accept_slot_|acsl_|cancel_)"))
     # Admin callback router
     app.add_handler(CallbackQueryHandler(admin_cb_router, pattern=r"^admin_"))
     app.add_handler(CommandHandler("help", lambda u,c: asyncio.create_task(u.message.reply_text("Usa /start"))))
@@ -2072,6 +2168,7 @@ def main():
     app.add_handler(CommandHandler("debug_config", lambda u,c: asyncio.create_task(debug_config_cmd(u,c))))
     app.add_handler(CommandHandler("admin", lambda u,c: asyncio.create_task(admin_cmd(u,c))))
     app.add_handler(CommandHandler("purge_day", lambda u,c: asyncio.create_task(purge_day_cmd(u,c))))
+    app.add_handler(CommandHandler("process_waitlist", lambda u,c: asyncio.create_task(process_waitlist_cmd(u,c))))
     # Error handler per diagnosticare blocchi imprevisti
     async def _err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Unhandled error", exc_info=context.error)
