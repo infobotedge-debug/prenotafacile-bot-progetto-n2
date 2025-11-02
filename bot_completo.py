@@ -13,6 +13,7 @@ from typing import List
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from ux_module import send_confirm
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,15 +47,11 @@ TOKEN = load_token()
 # Usa un percorso assoluto relativo a questo file per evitare di creare DB in cartelle diverse
 DB_PATH = os.path.join(os.path.dirname(__file__), "prenotafacile.db")
 SLOT_MINUTES = 30
-REMINDER_TEST_SECONDS = 30
-try:
-    REMINDER_AFTER_CONFIRM_SECONDS = int(os.environ.get("REMINDER_AFTER_CONFIRM_SECONDS", "30"))
-except Exception:
-    REMINDER_AFTER_CONFIRM_SECONDS = 30
-REMINDER_QUICK_TEST = os.environ.get("REMINDER_QUICK_TEST", "1").lower() in {"1","true","yes"}
-# In modalità quick test, se non specificato via env, usa 5 secondi per il promemoria post-conferma
-if REMINDER_QUICK_TEST and ("REMINDER_AFTER_CONFIRM_SECONDS" not in os.environ):
-    REMINDER_AFTER_CONFIRM_SECONDS = 5
+
+# Modalità Test/Produzione per Reminder Intelligente
+TEST_MODE = True  # Cambia in False per produzione
+REMINDER_DELAY = 5 if TEST_MODE else 24 * 60 * 60  # 5 secondi in test, 24 ore in produzione
+
 # Attesa tra notifiche consecutive della lista d'attesa (secondi)
 WAITLIST_STEP_SECONDS = int(os.environ.get("WAITLIST_STEP_SECONDS", "120"))
 
@@ -872,7 +869,18 @@ async def confirm_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("❌ Ops! Non ci sono più orari disponibili in questo giorno per l'operatrice scelta.")
                 return ConversationHandler.END
         await finalize_booking(q, context, svc, date_str, time_str, op_id, from_waitlist=False)
-        await q.edit_message_text("✅ Prenotazione confermata!\nRiceverai un promemoria poco prima.")
+        
+        # Usa il modulo UX per messaggio di conferma migliorato
+        booking_info = {
+            'date': date_str,
+            'time': time_str,
+            'service': svc['nome'],
+            'operator': operator_name(op_id),
+            'price': svc.get('prezzo')
+        }
+        # Crea un update fittizio per send_confirm
+        update_for_ux = update
+        await send_confirm(update_for_ux, context, booking_info, via_callback=True)
         return ConversationHandler.END
 
 async def show_my_bookings(update_or_cb, context: ContextTypes.DEFAULT_TYPE, via_callback=False):
@@ -1130,21 +1138,27 @@ async def finalize_booking(cb_or_update, context: ContextTypes.DEFAULT_TYPE, svc
     cur.execute("""INSERT INTO bookings (user_id, service_code, service_name, date, time, duration, operator_id, price, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, price_val, datetime.utcnow().isoformat()))
     booking_id = cur.lastrowid; con.commit(); con.close(); logger.info(f"Booking saved: id={booking_id} user={user_id} svc={svc['code']} date={date_str} time={time_str} op={op_id}")
-    appt_dt = datetime_from_date_time_str(date_str, time_str); remind_at = appt_dt - timedelta(seconds=REMINDER_TEST_SECONDS); delay = (remind_at - datetime.now()).total_seconds();
-    if delay < 1: delay = 1
-    try: context.application.job_queue.run_once(send_reminder_job, when=delay, data={"user_id": user_id, "service_name": svc["nome"], "date_str": date_str, "time_str": time_str})
-    except Exception: asyncio.create_task(reminder_background(delay, user_id, svc["nome"], date_str, time_str, context))
-    if REMINDER_AFTER_CONFIRM_SECONDS and REMINDER_AFTER_CONFIRM_SECONDS > 0:
-        try:
-            context.application.job_queue.run_once(send_post_confirm_reminder_job, when=REMINDER_AFTER_CONFIRM_SECONDS, data={"user_id": user_id, "service_name": svc['nome'], "date_str": date_str, "time_str": time_str, "price": price_val})
-            logger.info("Scheduled post-confirm reminder in %ss for user=%s", REMINDER_AFTER_CONFIRM_SECONDS, user_id)
-        except Exception as e:
-            logger.warning("Failed to schedule post-confirm reminder: %s", e)
-    if delay > 90 and REMINDER_QUICK_TEST and (not REMINDER_AFTER_CONFIRM_SECONDS or REMINDER_AFTER_CONFIRM_SECONDS <= 0):
-        try:
-            context.application.job_queue.run_once(send_reminder_job, when=30, data={"user_id": user_id, "service_name": f"{svc['nome']} (TEST)", "date_str": date.today().strftime('%Y-%m-%d'), "time_str": datetime.now().strftime('%H:%M')})
-        except Exception as e:
-            logger.warning("Failed to schedule quick test reminder: %s", e)
+    
+    # Calcola quando inviare il reminder
+    if TEST_MODE:
+        # In TEST: invia 5 secondi DOPO la prenotazione (per testare subito)
+        delay = REMINDER_DELAY  # 5 secondi
+        logger.info(f"TEST_MODE: Scheduled reminder in {delay}s AFTER booking for user={user_id}")
+    else:
+        # In PRODUZIONE: invia 24 ore PRIMA dell'appuntamento
+        appt_dt = datetime_from_date_time_str(date_str, time_str)
+        remind_at = appt_dt - timedelta(seconds=REMINDER_DELAY)
+        delay = (remind_at - datetime.now()).total_seconds()
+        if delay < 1: 
+            delay = 1  # Se l'appuntamento è troppo vicino, invia subito
+        logger.info(f"PRODUZIONE: Scheduled reminder in {delay}s ({delay/3600:.1f}h) BEFORE appointment for user={user_id}")
+    
+    try: 
+        context.application.job_queue.run_once(send_reminder_job, when=delay, data={"user_id": user_id, "service_name": svc["nome"], "date_str": date_str, "time_str": time_str})
+    except Exception as e: 
+        logger.warning("Failed to schedule reminder: %s", e)
+        asyncio.create_task(reminder_background(delay, user_id, svc["nome"], date_str, time_str, context))
+    
     if from_waitlist:
         con = db_conn(); cur = con.cursor(); cur.execute("DELETE FROM waitlist WHERE user_id=? AND date=? AND service_code= ?", (user_id, date_str, svc["code"]))
         con.commit(); con.close()
@@ -1164,21 +1178,27 @@ async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAU
     cur.execute("""INSERT INTO bookings (user_id, service_code, service_name, date, time, duration, operator_id, price, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, price_val, datetime.utcnow().isoformat()))
     booking_id = cur.lastrowid; con.commit(); con.close()
-    appt_dt = datetime_from_date_time_str(date_str, time_str); remind_at = appt_dt - timedelta(seconds=REMINDER_TEST_SECONDS); delay = (remind_at - datetime.now()).total_seconds();
-    if delay < 1: delay = 1
-    try: context.application.job_queue.run_once(send_reminder_job, when=delay, data={"user_id": user_id, "service_name": svc["nome"], "date_str": date_str, "time_str": time_str})
-    except Exception: asyncio.create_task(reminder_background(delay, user_id, svc["nome"], date_str, time_str, context))
-    if REMINDER_AFTER_CONFIRM_SECONDS and REMINDER_AFTER_CONFIRM_SECONDS > 0:
-        try:
-            context.application.job_queue.run_once(send_post_confirm_reminder_job, when=REMINDER_AFTER_CONFIRM_SECONDS, data={"user_id": user_id, "service_name": svc['nome'], "date_str": date_str, "time_str": time_str, "price": price_val})
-            logger.info("Scheduled post-confirm reminder in %ss for user=%s (accept)", REMINDER_AFTER_CONFIRM_SECONDS, user_id)
-        except Exception as e:
-            logger.warning("Failed to schedule post-confirm reminder (accept): %s", e)
-    if delay > 90 and REMINDER_QUICK_TEST and (not REMINDER_AFTER_CONFIRM_SECONDS or REMINDER_AFTER_CONFIRM_SECONDS <= 0):
-        try:
-            context.application.job_queue.run_once(send_reminder_job, when=30, data={"user_id": user_id, "service_name": f"{svc['nome']} (TEST)", "date_str": date.today().strftime('%Y-%m-%d'), "time_str": datetime.now().strftime('%H:%M')})
-        except Exception as e:
-            logger.warning("Failed to schedule quick test reminder (accept): %s", e)
+    
+    # Calcola quando inviare il reminder
+    if TEST_MODE:
+        # In TEST: invia 5 secondi DOPO la prenotazione (per testare subito)
+        delay = REMINDER_DELAY  # 5 secondi
+        logger.info(f"TEST_MODE: Scheduled reminder in {delay}s AFTER booking for user={user_id} (accept)")
+    else:
+        # In PRODUZIONE: invia 24 ore PRIMA dell'appuntamento
+        appt_dt = datetime_from_date_time_str(date_str, time_str)
+        remind_at = appt_dt - timedelta(seconds=REMINDER_DELAY)
+        delay = (remind_at - datetime.now()).total_seconds()
+        if delay < 1: 
+            delay = 1  # Se l'appuntamento è troppo vicino, invia subito
+        logger.info(f"PRODUZIONE: Scheduled reminder in {delay}s ({delay/3600:.1f}h) BEFORE appointment for user={user_id} (accept)")
+    
+    try: 
+        context.application.job_queue.run_once(send_reminder_job, when=delay, data={"user_id": user_id, "service_name": svc["nome"], "date_str": date_str, "time_str": time_str})
+    except Exception as e: 
+        logger.warning("Failed to schedule reminder (accept): %s", e)
+        asyncio.create_task(reminder_background(delay, user_id, svc["nome"], date_str, time_str, context))
+    
     # Avvisa gli altri utenti in lista d'attesa che lo slot è stato preso
     try:
         await notify_waitlist_slot_taken(context, date_str, time_str, svc["code"], svc["nome"], exclude_user_id=user_id)
@@ -1431,9 +1451,8 @@ async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def debug_config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Config attuale:\n" \
-        f"- REMINDER_AFTER_CONFIRM_SECONDS={REMINDER_AFTER_CONFIRM_SECONDS}\n" \
-        f"- REMINDER_QUICK_TEST={REMINDER_QUICK_TEST}\n" \
-        f"- REMINDER_TEST_SECONDS(before appt)={REMINDER_TEST_SECONDS}"
+        f"- TEST_MODE={TEST_MODE}\n" \
+        f"- REMINDER_DELAY={REMINDER_DELAY}s ({'5s in test' if TEST_MODE else '24h in produzione'})"
     )
 
 async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2002,25 +2021,36 @@ async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         center_id = r["id"] if r else 1
         bid = FULL_add_booking(center_id, op_id, svc_code, client_id, date_str, time_str, duration)
         
-        # Recupera il nome del servizio per il messaggio
-        cur.execute("SELECT title FROM services WHERE code=?", (svc_code,))
+        # Recupera dettagli per il messaggio
+        cur.execute("SELECT title, price FROM services WHERE code=?", (svc_code,))
         svc_row = cur.fetchone()
         svc_title = svc_row["title"] if svc_row else svc_code
+        svc_price = svc_row["price"] if svc_row and svc_row["price"] else None
+        
+        # Recupera nome operatore
+        cur.execute("SELECT name FROM operators WHERE id=?", (op_id,))
+        op_row = cur.fetchone()
+        op_name = op_row["name"] if op_row else None
         con.close()
         
-        # Messaggio di conferma con pulsanti utili
-        msg = (
-            f"✅ *Prenotazione confermata!*\n\n"
-            f"📋 Servizio: {svc_title}\n"
-            f"📅 Data: {date_str}\n"
-            f"🕐 Orario: {time_str}\n"
-            f"🆔 ID prenotazione: {bid}"
-        )
+        # Usa modulo UX per messaggio migliorato
+        booking_info = {
+            'date': date_str,
+            'time': time_str,
+            'service': svc_title,
+            'operator': op_name,
+            'price': svc_price,
+            'booking_id': bid
+        }
+        
+        # Pulsanti per navigazione
         kb = [
             [InlineKeyboardButton("📋 Le mie prenotazioni", callback_data="full_my_bookings")],
             [InlineKeyboardButton("🏠 Menu principale", callback_data="full_home")]
         ]
-        await q.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        
+        await send_confirm(update, context, booking_info, via_callback=True, 
+                          reply_markup=InlineKeyboardMarkup(kb), skip_warm_message=True)
         return
     if data == "full_my_bookings":
         user = update.effective_user; con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM clients WHERE tg_id=?", (user.id,)); r = cur.fetchone()
@@ -2072,12 +2102,18 @@ async def FULL_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Variante: {variant} (MODE={mode_env})\nBuild: {FULL_BUILD_VERSION}")
 
 def FULL_build_application():
+    # Importa modulo statistiche solo per FULL
+    from stats_module import stat_giorno, stat_settimana
+    
     # Crea Application normalmente - il problema era nella versione di PTB
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", FULL_start_cmd))
     app.add_handler(CallbackQueryHandler(FULL_callback_router, pattern=r"^(full_|fd_|fc_|ft_)"))
     app.add_handler(CommandHandler("admin_today", FULL_admin_today))
     app.add_handler(CommandHandler("export_csv", FULL_export_csv_cmd))
+    # Comandi statistiche admin (solo FULL)
+    app.add_handler(CommandHandler("stat_giorno", stat_giorno))
+    app.add_handler(CommandHandler("stat_settimana", stat_settimana))
     # Allinea comandi di servizio
     app.add_handler(CommandHandler("ping", FULL_ping_cmd))
     app.add_handler(CommandHandler("version", FULL_version_cmd))
@@ -2178,7 +2214,7 @@ def main():
         pass
 
     logger.info("PrenotaFacile minimal avviato. %s", BUILD_VERSION)
-    logger.info("Config: AFTER_CONFIRM=%s QUICK_TEST=%s BEFORE_APPT=%ss", REMINDER_AFTER_CONFIRM_SECONDS, REMINDER_QUICK_TEST, REMINDER_TEST_SECONDS)
+    logger.info("Config: TEST_MODE=%s REMINDER_DELAY=%ss", TEST_MODE, REMINDER_DELAY)
     force_webhook = os.environ.get("FORCE_WEBHOOK", "0").lower() in {"1","true","yes"}
     if force_webhook:
         # Avvio in webhook con ngrok (se disponibile)
@@ -2205,6 +2241,54 @@ def main():
             return
         except Exception as e:
             logger.warning("Falling back to polling (webhook error): %s", e)
+    
+    # ===================================================================
+    # AUTO-REPORT E BACKUP AUTOMATICO (ADMIN)
+    # ===================================================================
+    try:
+        from auto_commit import commit_to_github
+        from auto_backup import make_backup
+        
+        async def admin_auto_report(context: ContextTypes.DEFAULT_TYPE):
+            """Invia report automatico e salva su GitHub."""
+            try:
+                backup_paths = make_backup()
+                commit_success = commit_to_github()
+                
+                admin_id = 1235501437  # ID Telegram admin
+                
+                if backup_paths and commit_success:
+                    msg = (
+                        f"📊 *Backup e Commit Automatico Completato*\n\n"
+                        f"📁 Backup creati:\n"
+                    )
+                    for path in backup_paths:
+                        filename = os.path.basename(path)
+                        msg += f"  • {filename}\n"
+                    msg += f"\n✅ Salvato anche su GitHub"
+                    await context.bot.send_message(chat_id=admin_id, text=msg, parse_mode='Markdown')
+                else:
+                    error_msg = "❌ Errore durante backup/commit automatico"
+                    if not backup_paths:
+                        error_msg += "\n• Backup fallito"
+                    if not commit_success:
+                        error_msg += "\n• Commit GitHub fallito"
+                    await context.bot.send_message(chat_id=admin_id, text=error_msg)
+            except Exception as e:
+                await context.bot.send_message(
+                    chat_id=1235501437, 
+                    text=f"❌ Errore durante backup/commit automatico: {e}"
+                )
+        
+        # Job automatico ogni giorno alle 23:00
+        job_queue = app.job_queue
+        job_queue.run_daily(admin_auto_report, time=datetime.time(hour=23, minute=0))
+        logger.info("✅ Job automatico backup/commit configurato (ogni giorno alle 23:00)")
+    except ImportError as e:
+        logger.warning("⚠️ Moduli auto_commit/auto_backup non trovati. Job automatico non configurato.")
+    except Exception as e:
+        logger.warning(f"⚠️ Errore configurazione job automatico: {e}")
+    
     app.run_polling()
 
 if __name__ == "__main__":
