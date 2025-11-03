@@ -388,6 +388,32 @@ def ensure_sample_data():
 async def join_waitlist(user_id: int, date_str: str, svc_code: str) -> int:
     """Aggiunge l'utente alla lista d'attesa e restituisce la posizione (1-based)."""
     con = db_conn(); cur = con.cursor()
+
+    # In produzione vietiamo duplicati dello stesso utente per la stessa data/servizio.
+    if not TEST_MODE:
+        cur.execute(
+            "SELECT id FROM waitlist WHERE user_id=? AND date=? AND service_code=?",
+            (user_id, date_str, svc_code),
+        )
+        existing = cur.fetchone()
+        if existing:
+            logger.info(
+                "User %s already in waitlist for %s %s (entry id=%s)",
+                user_id,
+                date_str,
+                svc_code,
+                existing[0],
+            )
+            cur.execute(
+                "SELECT COUNT(*) FROM waitlist WHERE date=? AND service_code=? AND id <= ?",
+                (date_str, svc_code, existing[0]),
+            )
+            pos_row = cur.fetchone()
+            pos = pos_row[0] if pos_row else 1
+            con.close()
+            return int(pos) if pos else 1
+
+    # Aggiunge nuova entry
     cur.execute(
         "INSERT INTO waitlist (user_id, date, service_code, created_at) VALUES (?,?,?,?)",
         (user_id, date_str, svc_code, datetime.utcnow().isoformat()),
@@ -496,28 +522,44 @@ def day_status_symbol(d: date, durata: int) -> str:
 # Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user: context.user_data["username"] = getattr(user, "username", None)
+    logger.info(f"⭐ START command received from user {user.id if user else 'unknown'}")
+    logger.info(f"DEBUG: update.message exists: {getattr(update, 'message', None) is not None}")
+    
+    if user: 
+        context.user_data["username"] = getattr(user, "username", None)
+        logger.info(f"DEBUG: Username set: {context.user_data.get('username')}")
+    
+    logger.info("DEBUG: Creating keyboard...")
     kb = [[InlineKeyboardButton("👩 Donna", callback_data="gender_Donna"), InlineKeyboardButton("👨 Uomo", callback_data="gender_Uomo")],
           [InlineKeyboardButton("📆 Le mie prenotazioni", callback_data="my_bookings")],
           [InlineKeyboardButton("ℹ️ Help", callback_data="help")]]
     text = "Benvenuto in *PrenotaFacile* — scegli il profilo:"
+    
+    logger.info("DEBUG: Attempting to send message...")
     try:
         # Preferisci reply se è un normale messaggio
         if getattr(update, "message", None):
+            logger.info("DEBUG: Sending via reply_text...")
             await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+            logger.info("DEBUG: Message sent successfully!")
         else:
             # Fallback robusto: invia al chat_id effettivo (es. se /start arriva in contesti particolari)
+            logger.info("DEBUG: Using fallback send_message...")
             chat_id = update.effective_chat.id if getattr(update, "effective_chat", None) else (user.id if user else None)
             if chat_id is not None:
                 await context.application.bot.send_message(chat_id=chat_id, text=text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+                logger.info("DEBUG: Fallback message sent successfully!")
             else:
                 logger.warning("/start: impossibile determinare il chat_id")
     except Exception as e:
         logger.exception("Failed to send /start menu: %s", e)
+    
+    logger.info(f"DEBUG: Returning ASK_GENDER state")
     return ASK_GENDER
 
 async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer(); data = q.data
+    logger.info(f"🔵 Router received callback: {data}")
     if data == "ignore": return
     if data == "help":
         await q.edit_message_text("Aiuto: usa /start per ricominciare.\nLegenda: 🟢 giorno con disponibilità · 🔴 giorno pieno · ❌ orario occupato.\nUsa ⬅️ per tornare."); return
@@ -662,6 +704,7 @@ async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         await q.edit_message_text("Perfetto. Inserisci *Nome e Cognome*:", parse_mode=ParseMode.MARKDOWN); return ASK_NAME
     if data.startswith("acsl_") or data.startswith("accept_slot_"):
         # Nuovo formato compatto: acsl_YYYYMMDD|HH:MM|op_compact|svc_compact
+        waitlist_entry_id = None
         if data.startswith("acsl_"):
             # Recupera dati completi da bot_data
             if hasattr(context, 'bot_data') and data in context.bot_data:
@@ -670,6 +713,12 @@ async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 time_str = slot_data['time']
                 op_id = slot_data['op_id']
                 svc_code = slot_data['svc_code']
+                waitlist_entry_id = slot_data.get('waitlist_id')
+                # Rimuovi i dati usati per evitare riutilizzi successivi
+                try:
+                    context.bot_data.pop(data, None)
+                except Exception:
+                    pass
             else:
                 await q.edit_message_text("⚠️ Slot scaduto o non disponibile."); return
         else:
@@ -715,13 +764,26 @@ async def menu_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         svc = find_service_by_code(svc_code)
         if not svc: await q.edit_message_text("Servizio non valido."); return
         if is_slot_free_for_operator(date_str, time_str, svc["durata"], op_id):
-            await finalize_booking_from_accept(q.from_user.id, context, svc, date_str, time_str, op_id)
+            await finalize_booking_from_accept(q.from_user.id, context, svc, date_str, time_str, op_id, waitlist_entry_id=waitlist_entry_id)
             await q.edit_message_text("✅ Slot assegnato a te! Controlla le tue prenotazioni.")
         else:
             await q.edit_message_text("❌ Lo slot è già stato preso da un altro.")
         return
     if data.startswith("cancel_"):
+        logger.info(f"🔴 Cancel callback detected: {data}")
         booking_id = int(data.split("_",1)[1]); await cancel_booking(update, context, booking_id); return
+    if data.startswith("remove_waitlist_"):
+        waitlist_id = int(data.split("_",2)[2])
+        logger.info(f"🗑️ Removing waitlist entry: {waitlist_id}")
+        con = db_conn(); cur = con.cursor()
+        cur.execute("DELETE FROM waitlist WHERE id=? AND user_id=?", (waitlist_id, q.from_user.id))
+        deleted = cur.rowcount
+        con.commit(); con.close()
+        if deleted > 0:
+            await q.edit_message_text("✅ Rimosso dalla lista d'attesa.")
+        else:
+            await q.edit_message_text("❌ Entry non trovata.")
+        return
     try:
         await q.edit_message_text("Sessione aggiornata. Usa /start per ripartire.")
     except Exception:
@@ -886,25 +948,50 @@ async def confirm_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_my_bookings(update_or_cb, context: ContextTypes.DEFAULT_TYPE, via_callback=False):
     user = update_or_cb.callback_query.from_user if via_callback else update_or_cb.message.from_user
     con = db_conn(); cur = con.cursor();
+    
+    # Prenotazioni confermate
     cur.execute("SELECT id, service_name, date, time, duration, operator_id, price FROM bookings WHERE user_id=? ORDER BY date, time", (user.id,))
-    rows = cur.fetchall(); con.close()
-    if not rows:
+    bookings = cur.fetchall()
+    
+    # Lista d'attesa
+    cur.execute("SELECT id, date, service_code FROM waitlist WHERE user_id=? ORDER BY date", (user.id,))
+    waitlist = cur.fetchall()
+    con.close()
+    
+    if not bookings and not waitlist:
         if via_callback:
-            await update_or_cb.callback_query.edit_message_text("Non hai prenotazioni attive.")
+            await update_or_cb.callback_query.edit_message_text("Non hai prenotazioni o liste d'attesa attive.")
         else:
-            await update_or_cb.message.reply_text("Non hai prenotazioni attive.")
+            await update_or_cb.message.reply_text("Non hai prenotazioni o liste d'attesa attive.")
         return
+    
     lines = []
     kb = []
-    for bid, sname, d, t, dur, op, price in rows:
-        giorno = datetime.strptime(d, '%Y-%m-%d').strftime('%d/%m/%Y')
-        prezzo = format_price_eur(price)
-        lines.append(f"• [{bid}] {sname} – {giorno} {t} ({dur} min) – {operator_name(op)} – {prezzo}")
-        kb.append([InlineKeyboardButton(f"❌ Disdici [{bid}]", callback_data=f"cancel_{bid}")])
-    header = f"*Le tue prenotazioni ({len(rows)}):*\n"
+    
+    # Mostra prenotazioni confermate
+    if bookings:
+        lines.append(f"*📌 Prenotazioni confermate ({len(bookings)}):*")
+        for bid, sname, d, t, dur, op, price in bookings:
+            giorno = datetime.strptime(d, '%Y-%m-%d').strftime('%d/%m/%Y')
+            prezzo = format_price_eur(price)
+            lines.append(f"• [{bid}] {sname} – {giorno} {t} ({dur} min) – {operator_name(op)} – {prezzo}")
+            kb.append([InlineKeyboardButton(f"❌ Disdici [{bid}]", callback_data=f"cancel_{bid}")])
+    
+    # Mostra lista d'attesa
+    if waitlist:
+        if bookings:
+            lines.append("")  # Linea vuota tra sezioni
+        lines.append(f"*⏳ Liste d'attesa ({len(waitlist)}):*")
+        for wid, d, svc_code in waitlist:
+            giorno = datetime.strptime(d, '%Y-%m-%d').strftime('%d/%m/%Y')
+            svc = find_service_by_code(svc_code)
+            svc_name = svc["nome"] if svc else svc_code
+            lines.append(f"• [W{wid}] {svc_name} – {giorno}")
+            kb.append([InlineKeyboardButton(f"🗑️ Rimuovi dalla lista [W{wid}]", callback_data=f"remove_waitlist_{wid}")])
+    
     # Aggiunge un tasto per tornare al menu principale
     kb.append([InlineKeyboardButton("🏠 Menu", callback_data="home")])
-    text = header + "\n".join(lines)
+    text = "\n".join(lines)
     if via_callback:
         await update_or_cb.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
     else:
@@ -1163,7 +1250,7 @@ async def finalize_booking(cb_or_update, context: ContextTypes.DEFAULT_TYPE, svc
         con = db_conn(); cur = con.cursor(); cur.execute("DELETE FROM waitlist WHERE user_id=? AND date=? AND service_code= ?", (user_id, date_str, svc["code"]))
         con.commit(); con.close()
 
-async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAULT_TYPE, svc, date_str: str, time_str: str, op_id: str):
+async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAULT_TYPE, svc, date_str: str, time_str: str, op_id: str, waitlist_entry_id: int | None = None):
     try:
         chat = await context.application.bot.get_chat(user_id); username = getattr(chat, "username", None)
     except Exception:
@@ -1178,6 +1265,14 @@ async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAU
     cur.execute("""INSERT INTO bookings (user_id, service_code, service_name, date, time, duration, operator_id, price, created_at)
                    VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, price_val, datetime.utcnow().isoformat()))
     booking_id = cur.lastrowid; con.commit(); con.close()
+    
+    # Se la prenotazione arriva dalla lista d'attesa rimuovi solo quella entry
+    if waitlist_entry_id is not None:
+        con = db_conn(); cur = con.cursor()
+        cur.execute("DELETE FROM waitlist WHERE id=?", (waitlist_entry_id,))
+        removed = cur.rowcount
+        con.commit(); con.close()
+        logger.info("Waitlist entry %s removed after accept (rows=%s)", waitlist_entry_id, removed)
     
     # Calcola quando inviare il reminder
     if TEST_MODE:
@@ -1217,11 +1312,14 @@ async def cancel_booking(update: Update, context: ContextTypes.DEFAULT_TYPE, boo
 async def notify_waitlist(context: ContextTypes.DEFAULT_TYPE, date_str: str, time_str: str, op_id: str, svc_code: str, svc_name: str):
     """Avvia la notifica sequenziale agli utenti della lista d'attesa."""
     con = db_conn(); cur = con.cursor()
-    cur.execute("SELECT DISTINCT user_id FROM waitlist WHERE date=? AND service_code=? ORDER BY id ASC", (date_str, svc_code))
-    users = [r[0] for r in cur.fetchall()]
+    cur.execute(
+        "SELECT id, user_id FROM waitlist WHERE date=? AND service_code=? ORDER BY id ASC",
+        (date_str, svc_code),
+    )
+    entries = [{"id": row[0], "user_id": row[1]} for row in cur.fetchall()]
     con.close()
-    logger.info(f"Waitlist check: date={date_str} service={svc_code} -> {len(users)} users found")
-    if not users:
+    logger.info(f"Waitlist check: date={date_str} service={svc_code} -> {len(entries)} entries found")
+    if not entries:
         return
     # Primo step immediato
     try:
@@ -1229,7 +1327,7 @@ async def notify_waitlist(context: ContextTypes.DEFAULT_TYPE, date_str: str, tim
             waitlist_step_job,
             when=0,
             data={
-                "users": users,
+                "entries": entries,
                 "index": 0,
                 "date_str": date_str,
                 "time_str": time_str,
@@ -1243,19 +1341,29 @@ async def notify_waitlist(context: ContextTypes.DEFAULT_TYPE, date_str: str, tim
 
 async def waitlist_step_job(context: ContextTypes.DEFAULT_TYPE):
     data = getattr(context.job, 'data', {}) or {}
-    users = data.get("users") or []
+    entries = data.get("entries") or []
     idx = int(data.get("index", 0))
     date_str = data.get("date_str"); time_str = data.get("time_str")
     op_id = data.get("op_id"); svc_code = data.get("svc_code"); svc_name = data.get("svc_name")
-    if not users or idx >= len(users) or not all([date_str, time_str, op_id, svc_code]):
+    
+    logger.info(f"🔔 waitlist_step_job called: idx={idx}/{len(entries)} date={date_str} time={time_str} svc={svc_code}")
+    
+    if not entries or idx >= len(entries) or not all([date_str, time_str, op_id, svc_code]):
+        logger.warning(f"❌ Waitlist step aborted: entries={len(entries)} idx={idx} date={date_str} time={time_str} op={op_id} svc={svc_code}")
         return
     svc = find_service_by_code(svc_code)
     if not svc:
+        logger.warning(f"❌ Service not found: {svc_code}")
         return
     # Interrompi se lo slot non è più libero
     if not is_slot_free_for_operator(date_str, time_str, svc["durata"], op_id):
+        logger.info(f"⏹️ Slot no longer available: {date_str} {time_str}")
         return
-    uid = users[idx]
+    entry = entries[idx]
+    waitlist_id = entry.get("id")
+    uid = entry.get("user_id")
+    logger.info(f"📤 Sending waitlist notification to user {uid} (waitlist_id={waitlist_id})")
+    
     # Escape caratteri speciali Markdown nel nome servizio
     svc_name_escaped = svc_name.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]')
     text = (
@@ -1279,24 +1387,24 @@ async def waitlist_step_job(context: ContextTypes.DEFAULT_TYPE):
         'date': date_str,
         'time': time_str,
         'op_id': op_id,
-        'svc_code': svc_code
+        'svc_code': svc_code,
+        'waitlist_id': waitlist_id,
     }
     kb = [[InlineKeyboardButton("📌 Prenota questo slot", callback_data=callback_str)]]
     try:
         await context.application.bot.send_message(uid, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN)
+        logger.info(f"✅ Waitlist notification sent successfully to user {uid}")
     except Exception as e:
-        logger.error(f"Failed to send waitlist notification to user={uid}: {e}")
-    except Exception as e:
-        logger.debug("Invio notifica waitlist fallito per user=%s: %s", uid, e)
+        logger.error(f"❌ Failed to send waitlist notification to user {uid}: {e}")
     # Pianifica il prossimo utente se resta libero
     next_idx = idx + 1
-    if next_idx < len(users):
+    if next_idx < len(entries):
         try:
             context.application.job_queue.run_once(
                 waitlist_step_job,
                 when=max(1, WAITLIST_STEP_SECONDS),
                 data={
-                    "users": users,
+                    "entries": entries,
                     "index": next_idx,
                     "date_str": date_str,
                     "time_str": time_str,
@@ -2179,7 +2287,7 @@ def main():
     app.add_handler(build_conversation())
     app.add_handler(CallbackQueryHandler(confirm_router, pattern=r"^confirm_(yes|no)$"))
     # Catch-all di sicurezza per i principali callback se uscissi dalla Conversation
-    app.add_handler(CallbackQueryHandler(menu_callback_router, pattern=r"^(gender_|cat_|svc_|op_|cal_|pickmonths_|day_|time_|waitlist_join|accept_slot_|acsl_|cancel_)"))
+    app.add_handler(CallbackQueryHandler(menu_callback_router, pattern=r"^(gender_|cat_|svc_|op_|cal_|pickmonths_|day_|time_|waitlist_join|accept_slot_|acsl_|cancel_|remove_waitlist_)"))
     # Admin callback router
     app.add_handler(CallbackQueryHandler(admin_cb_router, pattern=r"^admin_"))
     app.add_handler(CommandHandler("help", lambda u,c: asyncio.create_task(u.message.reply_text("Usa /start"))))
