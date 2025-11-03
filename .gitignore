@@ -11,11 +11,6 @@ bot_run.log
 bot_err.log
 bot.pid
 
-# Backup e log automatici
-backups/
-auto_commit.log
-auto_backup.log
-
 # Editor/OS
 .DS_Store
 .vscode/

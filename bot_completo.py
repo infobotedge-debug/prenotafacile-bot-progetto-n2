@@ -49,7 +49,15 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "prenotafacile.db")
 SLOT_MINUTES = 30
 
 # Modalità Test/Produzione per Reminder Intelligente
-TEST_MODE = True  # Cambia in False per produzione
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+TEST_MODE = env_flag("TEST_MODE", default=True)
 REMINDER_DELAY = 5 if TEST_MODE else 24 * 60 * 60  # 5 secondi in test, 24 ore in produzione
 
 # Attesa tra notifiche consecutive della lista d'attesa (secondi)
@@ -131,6 +139,156 @@ SERVIZI = {
 def db_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
+
+def ensure_unified_schema():
+    """Allinea lo schema del DB per l'uso con entrambe le varianti."""
+    con = db_conn(); cur = con.cursor()
+
+    # Tabella clients principale (migrazione da schema legacy se necessario)
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='clients'")
+    has_clients_table = cur.fetchone() is not None
+
+    if not has_clients_table:
+        cur.execute(
+            """
+            CREATE TABLE clients (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tg_id INTEGER UNIQUE,
+                username TEXT,
+                name TEXT,
+                phone TEXT,
+                notes TEXT,
+                last_seen TEXT
+            )
+            """
+        )
+        has_clients_table = True
+    else:
+        cur.execute("PRAGMA table_info(clients)")
+        client_cols = {row[1] for row in cur.fetchall()}
+        if "id" not in client_cols:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS clients_tmp (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tg_id INTEGER UNIQUE,
+                    username TEXT,
+                    name TEXT,
+                    phone TEXT,
+                    notes TEXT,
+                    last_seen TEXT
+                )
+                """
+            )
+            cur.execute(
+                """
+                INSERT OR IGNORE INTO clients_tmp (tg_id, username, name, phone, notes, last_seen)
+                SELECT COALESCE(tg_id, user_id), username, name, phone, notes, last_seen FROM clients
+                """
+            )
+            cur.execute("DROP TABLE clients")
+            cur.execute("ALTER TABLE clients_tmp RENAME TO clients")
+
+    # Copia eventuali record legacy dalla tabella users nella nuova struttura
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+    if cur.fetchone():
+        cur.execute(
+            """
+            INSERT OR IGNORE INTO clients (tg_id, username, name, phone, notes)
+            SELECT user_id, username, name, phone, notes FROM users
+            """
+        )
+
+    # Colonne mancanti su bookings
+    cur.execute("PRAGMA table_info(bookings)")
+    booking_cols = {row[1] for row in cur.fetchall()}
+
+    def ensure_booking_column(col_name: str, ddl: str, post_update_sql: str | None = None):
+        if col_name not in booking_cols:
+            cur.execute(f"ALTER TABLE bookings ADD COLUMN {ddl}")
+            if post_update_sql:
+                cur.execute(post_update_sql)
+            booking_cols.add(col_name)
+
+    ensure_booking_column("client_id", "client_id INTEGER", None)
+    ensure_booking_column("center_id", "center_id INTEGER DEFAULT 1", "UPDATE bookings SET center_id=1 WHERE center_id IS NULL")
+    ensure_booking_column("status", "status TEXT DEFAULT 'CONFIRMED'", "UPDATE bookings SET status='CONFIRMED' WHERE status IS NULL")
+    ensure_booking_column("reminder_sent", "reminder_sent INTEGER DEFAULT 0", "UPDATE bookings SET reminder_sent=0 WHERE reminder_sent IS NULL")
+
+    # Colonne mancanti su waitlist
+    cur.execute("PRAGMA table_info(waitlist)")
+    waitlist_cols = {row[1] for row in cur.fetchall()}
+    if "client_id" not in waitlist_cols:
+        cur.execute("ALTER TABLE waitlist ADD COLUMN client_id INTEGER")
+        waitlist_cols.add("client_id")
+
+    # Popola client_id mancanti sfruttando tg_id
+    cur.execute(
+        """
+        UPDATE bookings
+        SET client_id = (
+            SELECT id FROM clients WHERE tg_id = bookings.user_id
+        )
+        WHERE client_id IS NULL AND user_id IS NOT NULL
+        """
+    )
+    cur.execute(
+        """
+        UPDATE waitlist
+        SET client_id = (
+            SELECT id FROM clients WHERE tg_id = waitlist.user_id
+        )
+        WHERE client_id IS NULL AND user_id IS NOT NULL
+        """
+    )
+
+    con.commit(); con.close()
+
+
+def ensure_client_for_user(user_id: int, username: str | None = None, name: str | None = None, phone: str | None = None, notes: str | None = None) -> int | None:
+    """Crea/aggiorna il mapping verso clients e restituisce l'id client."""
+    now = datetime.utcnow().isoformat()
+    con = db_conn(); cur = con.cursor()
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO clients (tg_id, username, name, phone, notes, last_seen)
+        VALUES (?,?,?,?,?,?)
+        """,
+        (user_id, username, name, phone, notes, now),
+    )
+    cur.execute(
+        """
+        UPDATE clients
+        SET username=COALESCE(?, username),
+            name=COALESCE(?, name),
+            phone=COALESCE(?, phone),
+            notes=COALESCE(?, notes),
+            last_seen=?
+        WHERE tg_id=?
+        """,
+        (username, name, phone, notes, now, user_id),
+    )
+    cur.execute("SELECT id FROM clients WHERE tg_id=?", (user_id,))
+    row = cur.fetchone()
+    con.commit(); con.close()
+    return row[0] if row else None
+
+
+def get_client_id_for_user(user_id: int) -> int | None:
+    con = db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM clients WHERE tg_id=?", (user_id,)); row = cur.fetchone(); con.close(); return row[0] if row else None
+
+
+def resolve_default_center_id() -> int:
+    con = db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM centers ORDER BY id LIMIT 1"); row = cur.fetchone()
+    if row:
+        center_id = row[0]
+    else:
+        cur.execute("INSERT INTO centers(name) VALUES(?)", ("Centro Principale",))
+        center_id = cur.lastrowid
+        con.commit()
+    con.close()
+    return center_id
+
 def init_db():
     con = db_conn(); cur = con.cursor()
     cur.execute("""
@@ -146,6 +304,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
+            client_id INTEGER,
+            center_id INTEGER,
             service_code TEXT,
             service_name TEXT,
             date TEXT,
@@ -153,13 +313,16 @@ def init_db():
             duration INTEGER,
             operator_id TEXT,
             price REAL,
-            created_at TEXT
+            created_at TEXT,
+            status TEXT DEFAULT 'CONFIRMED',
+            reminder_sent INTEGER DEFAULT 0
         )
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS waitlist (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
+            client_id INTEGER,
             date TEXT,
             service_code TEXT,
             created_at TEXT
@@ -388,6 +551,7 @@ def ensure_sample_data():
 async def join_waitlist(user_id: int, date_str: str, svc_code: str) -> int:
     """Aggiunge l'utente alla lista d'attesa e restituisce la posizione (1-based)."""
     con = db_conn(); cur = con.cursor()
+    client_id = ensure_client_for_user(user_id)
 
     # In produzione vietiamo duplicati dello stesso utente per la stessa data/servizio.
     if not TEST_MODE:
@@ -415,8 +579,8 @@ async def join_waitlist(user_id: int, date_str: str, svc_code: str) -> int:
 
     # Aggiunge nuova entry
     cur.execute(
-        "INSERT INTO waitlist (user_id, date, service_code, created_at) VALUES (?,?,?,?)",
-        (user_id, date_str, svc_code, datetime.utcnow().isoformat()),
+        "INSERT INTO waitlist (user_id, client_id, date, service_code, created_at) VALUES (?,?,?,?,?)",
+        (user_id, client_id, date_str, svc_code, datetime.utcnow().isoformat()),
     )
     con.commit()
     # Calcola posizione corrente
@@ -432,22 +596,27 @@ async def join_waitlist(user_id: int, date_str: str, svc_code: str) -> int:
 # ------------------------
 # UTENTE - SALVATAGGIO E AGGIORNAMENTO
 # ------------------------
-def save_or_update_user(user_id: int, username: str | None = None, name: str | None = None, phone: str | None = None, notes: str | None = None):
-    """Salva o aggiorna i dati utente in modo robusto."""
-    con = db_conn()
-    cur = con.cursor()
-    # Inserisce solo se non esiste
-    cur.execute(
-        "INSERT OR IGNORE INTO users (user_id, username, name, phone, notes) VALUES (?,?,?,?,?)",
-        (user_id, username, name, phone, notes),
-    )
-    # Aggiorna dati esistenti
-    cur.execute(
-        "UPDATE users SET username=?, name=?, phone=?, notes=? WHERE user_id=?",
-        (username, name, phone, notes, user_id),
-    )
-    con.commit()
-    con.close()
+def save_or_update_user(user_id: int, username: str | None = None, name: str | None = None, phone: str | None = None, notes: str | None = None) -> int | None:
+    """Salva/aggiorna i dati utente su clients e mantiene la tabella legacy users."""
+    client_id = ensure_client_for_user(user_id, username=username, name=name, phone=phone, notes=notes)
+
+    # Mantieni sincronizzata la tabella legacy users se presente
+    try:
+        con = db_conn(); cur = con.cursor()
+        cur.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, name, phone, notes) VALUES (?,?,?,?,?)",
+            (user_id, username, name, phone, notes),
+        )
+        cur.execute(
+            "UPDATE users SET username=?, name=?, phone=?, notes=? WHERE user_id=?",
+            (username, name, phone, notes, user_id),
+        )
+        con.commit(); con.close()
+    except Exception:
+        # Se la tabella non esiste più ignoriamo l'errore
+        pass
+
+    return client_id
 
 def parse_time_hhmm(s: str) -> time:
     h, m = map(int, s.split(":")); return time(hour=h, minute=m)
@@ -1213,17 +1382,45 @@ async def finalize_booking(cb_or_update, context: ContextTypes.DEFAULT_TYPE, svc
             user_id = user_obj.id
             username = getattr(user_obj, "username", None) or context.user_data.get("username")
     # Salva/aggiorna dati utente in modo centralizzato
-    save_or_update_user(
+    client_id = save_or_update_user(
         user_id=user_id,
         username=username,
         name=context.user_data.get("name"),
         phone=context.user_data.get("phone"),
         notes=context.user_data.get("notes"),
     )
+    if client_id is None:
+        client_id = ensure_client_for_user(user_id, username=username, name=context.user_data.get("name"), phone=context.user_data.get("phone"), notes=context.user_data.get("notes"))
+
+    center_id = resolve_default_center_id()
     con = db_conn(); cur = con.cursor()
     price_val = normalize_price(svc.get("prezzo"))
-    cur.execute("""INSERT INTO bookings (user_id, service_code, service_name, date, time, duration, operator_id, price, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, price_val, datetime.utcnow().isoformat()))
+    cur.execute(
+        """
+        INSERT INTO bookings (
+            user_id, client_id, center_id,
+            service_code, service_name,
+            date, time, duration,
+            operator_id, price, created_at,
+            status, reminder_sent
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            user_id,
+            client_id,
+            center_id,
+            svc["code"],
+            svc["nome"],
+            date_str,
+            time_str,
+            svc["durata"],
+            op_id,
+            price_val,
+            datetime.utcnow().isoformat(),
+            "CONFIRMED",
+            0,
+        ),
+    )
     booking_id = cur.lastrowid; con.commit(); con.close(); logger.info(f"Booking saved: id={booking_id} user={user_id} svc={svc['code']} date={date_str} time={time_str} op={op_id}")
     
     # Calcola quando inviare il reminder
@@ -1256,14 +1453,44 @@ async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAU
     except Exception:
         username = None
     # Allinea i dati utente
+    client_id: int | None = None
     try:
-        save_or_update_user(user_id=user_id, username=username)
+        client_id = save_or_update_user(user_id=user_id, username=username)
     except Exception as e:
         logger.debug("save_or_update_user (accept) fallito: %s", e)
+        client_id = ensure_client_for_user(user_id, username=username)
+    else:
+        if client_id is None:
+            client_id = ensure_client_for_user(user_id, username=username)
+    center_id = resolve_default_center_id()
     con = db_conn(); cur = con.cursor();
     price_val = normalize_price(svc.get("prezzo"))
-    cur.execute("""INSERT INTO bookings (user_id, service_code, service_name, date, time, duration, operator_id, price, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?)""", (user_id, svc["code"], svc["nome"], date_str, time_str, svc["durata"], op_id, price_val, datetime.utcnow().isoformat()))
+    cur.execute(
+        """
+        INSERT INTO bookings (
+            user_id, client_id, center_id,
+            service_code, service_name,
+            date, time, duration,
+            operator_id, price, created_at,
+            status, reminder_sent
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            user_id,
+            client_id,
+            center_id,
+            svc["code"],
+            svc["nome"],
+            date_str,
+            time_str,
+            svc["durata"],
+            op_id,
+            price_val,
+            datetime.utcnow().isoformat(),
+            "CONFIRMED",
+            0,
+        ),
+    )
     booking_id = cur.lastrowid; con.commit(); con.close()
     
     # Se la prenotazione arriva dalla lista d'attesa rimuovi solo quella entry
@@ -1582,7 +1809,7 @@ FULL_ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "@Wineorange")
 FULL_BUILD_VERSION = os.getenv("GITHUB_RUN_ID", "dev-local")
 
 # DB per FULL (separato dal minimal)
-FULL_DB_PATH = os.path.join(os.path.dirname(__file__), "prenotafacile_full.db")
+FULL_DB_PATH = DB_PATH
 
 FULL_DB_SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -1923,7 +2150,42 @@ def FULL_find_or_create_client(tg_id: int, name: str | None = None, phone: str |
     con.commit(); con.close(); return cid
 
 def FULL_add_booking(center_id:int, operator_id:str, service_code:str, client_id:int, dstr:str, tstr:str, duration:int) -> int:
-    con = FULL_db_conn(); cur = con.cursor(); cur.execute("INSERT INTO bookings(center_id, operator_id, service_code, client_id, date, time, duration) VALUES(?,?,?,?,?,?,?)", (center_id, operator_id, service_code, client_id, dstr, tstr, duration)); bid = cur.lastrowid; con.commit(); con.close(); return bid
+    con = FULL_db_conn(); cur = con.cursor()
+    cur.execute("SELECT tg_id FROM clients WHERE id=?", (client_id,))
+    client_row = cur.fetchone()
+    tg_id = client_row["tg_id"] if client_row and "tg_id" in client_row.keys() else (client_row[0] if client_row else None)
+
+    cur.execute("SELECT title, price FROM services WHERE code=?", (service_code,))
+    svc_row = cur.fetchone()
+    svc_title = svc_row["title"] if svc_row and "title" in svc_row.keys() else (svc_row[0] if svc_row else service_code)
+    svc_price = svc_row["price"] if svc_row and ("price" in svc_row.keys()) else (svc_row[1] if svc_row and len(svc_row) > 1 else None)
+
+    cur.execute(
+        """
+        INSERT INTO bookings (
+            user_id, client_id, center_id,
+            operator_id, service_code, service_name,
+            date, time, duration,
+            price, created_at, status, reminder_sent
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            tg_id,
+            client_id,
+            center_id,
+            operator_id,
+            service_code,
+            svc_title or service_code,
+            dstr,
+            tstr,
+            duration,
+            svc_price,
+            datetime.utcnow().isoformat(),
+            "CONFIRMED",
+            0,
+        ),
+    )
+    bid = cur.lastrowid; con.commit(); con.close(); return bid
 
 def FULL_cancel_booking(booking_id:int) -> bool:
     con = FULL_db_conn(); cur = con.cursor(); cur.execute("UPDATE bookings SET status='CANCELLED' WHERE id=? AND status='CONFIRMED'", (booking_id,)); ok = cur.rowcount > 0; con.commit(); con.close(); return ok
@@ -2222,6 +2484,7 @@ def FULL_build_application():
     # Comandi statistiche admin (solo FULL)
     app.add_handler(CommandHandler("stat_giorno", stat_giorno))
     app.add_handler(CommandHandler("stat_settimana", stat_settimana))
+    app.add_handler(CommandHandler("debug_config", debug_config_cmd))
     # Allinea comandi di servizio
     app.add_handler(CommandHandler("ping", FULL_ping_cmd))
     app.add_handler(CommandHandler("version", FULL_version_cmd))
@@ -2253,6 +2516,7 @@ def main():
     if variant == "full":
         # Inizializza DB e dati
         FULL_init_db()
+        ensure_unified_schema()
         FULL_migrate_db()
         FULL_ensure_sample_data()
         # Crea applicazione
@@ -2281,6 +2545,7 @@ def main():
             logger.info("Arresto manuale (FULL)")
         return
     init_db()
+    ensure_unified_schema()
     migrate_db()
     ensure_sample_data()
     app = Application.builder().token(TOKEN).build()
@@ -2349,53 +2614,6 @@ def main():
             return
         except Exception as e:
             logger.warning("Falling back to polling (webhook error): %s", e)
-    
-    # ===================================================================
-    # AUTO-REPORT E BACKUP AUTOMATICO (ADMIN)
-    # ===================================================================
-    try:
-        from auto_commit import commit_to_github
-        from auto_backup import make_backup
-        
-        async def admin_auto_report(context: ContextTypes.DEFAULT_TYPE):
-            """Invia report automatico e salva su GitHub."""
-            try:
-                backup_paths = make_backup()
-                commit_success = commit_to_github()
-                
-                admin_id = 1235501437  # ID Telegram admin
-                
-                if backup_paths and commit_success:
-                    msg = (
-                        f"📊 *Backup e Commit Automatico Completato*\n\n"
-                        f"📁 Backup creati:\n"
-                    )
-                    for path in backup_paths:
-                        filename = os.path.basename(path)
-                        msg += f"  • {filename}\n"
-                    msg += f"\n✅ Salvato anche su GitHub"
-                    await context.bot.send_message(chat_id=admin_id, text=msg, parse_mode='Markdown')
-                else:
-                    error_msg = "❌ Errore durante backup/commit automatico"
-                    if not backup_paths:
-                        error_msg += "\n• Backup fallito"
-                    if not commit_success:
-                        error_msg += "\n• Commit GitHub fallito"
-                    await context.bot.send_message(chat_id=admin_id, text=error_msg)
-            except Exception as e:
-                await context.bot.send_message(
-                    chat_id=1235501437, 
-                    text=f"❌ Errore durante backup/commit automatico: {e}"
-                )
-        
-        # Job automatico ogni giorno alle 23:00
-        job_queue = app.job_queue
-        job_queue.run_daily(admin_auto_report, time=datetime.time(hour=23, minute=0))
-        logger.info("✅ Job automatico backup/commit configurato (ogni giorno alle 23:00)")
-    except ImportError as e:
-        logger.warning("⚠️ Moduli auto_commit/auto_backup non trovati. Job automatico non configurato.")
-    except Exception as e:
-        logger.warning(f"⚠️ Errore configurazione job automatico: {e}")
     
     app.run_polling()
 
