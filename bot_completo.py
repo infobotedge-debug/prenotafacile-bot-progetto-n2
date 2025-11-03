@@ -14,6 +14,7 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFi
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from ux_module import send_confirm
+from stats_module import get_daily_stats_text, get_weekly_stats_text
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -222,14 +223,28 @@ def ensure_unified_schema():
         cur.execute("ALTER TABLE waitlist ADD COLUMN client_id INTEGER")
         waitlist_cols.add("client_id")
 
-    # Popola client_id mancanti sfruttando tg_id
+    # Assicura che esistano record clients per ogni user_id visto in bookings/waitlist
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO clients (tg_id, last_seen)
+        SELECT DISTINCT user_id, datetime('now') FROM bookings WHERE user_id IS NOT NULL
+        """
+    )
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO clients (tg_id, last_seen)
+        SELECT DISTINCT user_id, datetime('now') FROM waitlist WHERE user_id IS NOT NULL
+        """
+    )
+
+    # Popola/Reallinea client_id sfruttando tg_id
     cur.execute(
         """
         UPDATE bookings
         SET client_id = (
             SELECT id FROM clients WHERE tg_id = bookings.user_id
         )
-        WHERE client_id IS NULL AND user_id IS NOT NULL
+        WHERE user_id IS NOT NULL
         """
     )
     cur.execute(
@@ -238,7 +253,7 @@ def ensure_unified_schema():
         SET client_id = (
             SELECT id FROM clients WHERE tg_id = waitlist.user_id
         )
-        WHERE client_id IS NULL AND user_id IS NOT NULL
+        WHERE user_id IS NOT NULL
         """
     )
 
@@ -1070,7 +1085,9 @@ async def ask_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.MARKDOWN); return CONFIRM
 
 async def confirm_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
+    q = update.callback_query
+    logger.debug("[MINIMAL] confirm_router triggered data=%s user_keys=%s", getattr(q, "data", None), sorted(context.user_data.keys()))
+    await q.answer()
     if q.data == "confirm_no":
         try: await q.edit_message_text("Prenotazione annullata. /start")
         except Exception: pass
@@ -1080,6 +1097,7 @@ async def confirm_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "confirm_yes":
         svc = context.user_data.get("service"); date_str = context.user_data.get("date"); time_str = context.user_data.get("time"); op_id = context.user_data.get("operator_id")
         if not svc or not date_str or not time_str:
+            logger.warning("[MINIMAL] confirm_yes missing data svc=%s date=%s time=%s op=%s", bool(svc), date_str, time_str, context.user_data.get("operator_id"))
             await q.answer("Sessione scaduta o già gestita", show_alert=False)
             try: await q.edit_message_text("Sessione scaduta. /start")
             except Exception: pass
@@ -1403,7 +1421,7 @@ async def finalize_booking(cb_or_update, context: ContextTypes.DEFAULT_TYPE, svc
             date, time, duration,
             operator_id, price, created_at,
             status, reminder_sent
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             user_id,
@@ -1473,7 +1491,7 @@ async def finalize_booking_from_accept(user_id: int, context: ContextTypes.DEFAU
             date, time, duration,
             operator_id, price, created_at,
             status, reminder_sent
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             user_id,
@@ -1599,17 +1617,7 @@ async def waitlist_step_job(context: ContextTypes.DEFAULT_TYPE):
         "Premi il bottone per prenotarlo ora (primo che conferma lo ottiene).\n"
         f"⏳ Hai {WAITLIST_STEP_SECONDS} secondi prima che venga proposto al prossimo."
     )
-    # Callback compatto: formato YYYYMMDD|HH:MM|op_id_corto|svc_code_corto  
-    # Estrae solo le cifre da op_id e abbrevia date
-    date_compact = date_str.replace('-', '')  # 20251029
-    op_compact = op_id.replace('op_', '')  # sara, giulia, martina
-    # Usa solo prime lettere del service code per abbreviare
-    svc_parts = svc_code.split('_')
-    svc_compact = svc_parts[0][0] + '_' + '_'.join(p[:3] for p in svc_parts[1:]) if len(svc_parts) > 1 else svc_code[:10]
-    callback_str = f"acsl_{date_compact}|{time_str}|{op_compact}|{svc_compact}"
-    # Salva temporaneamente in context.bot_data per recuperare i dati completi quando viene cliccato
-    if not hasattr(context, 'bot_data'):
-        context.bot_data = {}
+    callback_str = f"acsl_{waitlist_id}"
     context.bot_data[callback_str] = {
         'date': date_str,
         'time': time_str,
@@ -1873,29 +1881,16 @@ CREATE TABLE IF NOT EXISTS waitlist_full (
 """
 
 def FULL_db_conn():
-    con = sqlite3.connect(FULL_DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)
+    con = sqlite3.connect(FULL_DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, check_same_thread=False)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
     return con
 
 def FULL_init_db():
-    con = FULL_db_conn(); cur = con.cursor(); cur.executescript(FULL_DB_SCHEMA); con.commit(); con.close()
+    init_db()
 
 def FULL_migrate_db():
-    """Esegue migrazioni minime: aggiunge colonne missing su services (gender, category)."""
-    con = FULL_db_conn(); cur = con.cursor()
-    cur.execute("PRAGMA table_info(services)")
-    cols = {row[1] for row in cur.fetchall()}  # name is index 1
-    if "gender" not in cols:
-        try:
-            cur.execute("ALTER TABLE services ADD COLUMN gender TEXT DEFAULT 'Donna'")
-        except Exception:
-            pass
-    if "category" not in cols:
-        try:
-            cur.execute("ALTER TABLE services ADD COLUMN category TEXT DEFAULT 'Generale'")
-        except Exception:
-            pass
-    con.commit(); con.close()
+    migrate_db()
 
 def FULL_create_center_if_missing(name: str = "Default Centro") -> int:
     con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM centers WHERE name=?", (name,)); r = cur.fetchone()
@@ -1906,161 +1901,38 @@ def FULL_create_center_if_missing(name: str = "Default Centro") -> int:
     con.close(); return cid
 
 def FULL_ensure_sample_data():
-    con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT COUNT(*) FROM centers")
-    if cur.fetchone()[0] == 0:
-        cid = FULL_create_center_if_missing("Centro Demo")
-        # Operatrici base
-        cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_sara", cid, "Sara", "09:00", "18:00"))
-        cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_giulia", cid, "Giulia", "09:00", "18:00"))
-        cur.execute("INSERT OR REPLACE INTO operators(id, center_id, name, work_start, work_end) VALUES(?,?,?,?,?)", ("op_martina", cid, "Martina", "09:00", "18:00"))
-        
-        # Servizi Donna - Completi come nella minimal
-        Donna = "Donna"
-        cur.executemany(
-            "INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price, gender, category) VALUES(?,?,?,?,?,?,?)",
-            [
-                # Trattamenti Viso
-                ("d_viso_pulizia", cid, "Pulizia del viso", 60, 40.0, Donna, "Trattamenti Viso"),
-                ("d_viso_antiage", cid, "Trattamento anti-age", 75, 60.0, Donna, "Trattamenti Viso"),
-                ("d_viso_idratante", cid, "Trattamento viso idratante", 45, 35.0, Donna, "Trattamenti Viso"),
-                ("d_viso_purificante", cid, "Trattamento viso purificante", 50, 38.0, Donna, "Trattamenti Viso"),
-                ("d_viso_peeling", cid, "Peeling viso", 40, 42.0, Donna, "Trattamenti Viso"),
-                
-                # Unghie
-                ("d_unghie_semipermanente", cid, "Semipermanente mani", 60, 30.0, Donna, "Unghie"),
-                ("d_unghie_refill_gel", cid, "Refill gel", 75, 40.0, Donna, "Unghie"),
-                ("d_unghie_manicure", cid, "Manicure classica", 40, 20.0, Donna, "Unghie"),
-                ("d_unghie_pedicure", cid, "Pedicure", 45, 25.0, Donna, "Unghie"),
-                ("d_unghie_ricostruzione", cid, "Ricostruzione unghie", 90, 50.0, Donna, "Unghie"),
-                ("d_unghie_french", cid, "French manicure", 50, 28.0, Donna, "Unghie"),
-                
-                # Estetica
-                ("d_estetica_epilazione", cid, "Epilazione completa", 60, 35.0, Donna, "Estetica"),
-                ("d_estetica_sopracciglia", cid, "Definizione sopracciglia", 15, 8.0, Donna, "Estetica"),
-                ("d_estetica_ceretta_completa", cid, "Ceretta completa", 60, 40.0, Donna, "Estetica"),
-                ("d_estetica_ceretta_gambe", cid, "Ceretta gambe", 40, 25.0, Donna, "Estetica"),
-                ("d_estetica_ceretta_inguine", cid, "Ceretta inguine", 30, 20.0, Donna, "Estetica"),
-                ("d_estetica_extension_ciglia", cid, "Extension ciglia", 90, 60.0, Donna, "Estetica"),
-                ("d_estetica_tinta_ciglia", cid, "Tinta ciglia", 20, 15.0, Donna, "Estetica"),
-                ("d_estetica_laminazione", cid, "Laminazione ciglia", 60, 45.0, Donna, "Estetica"),
-                
-                # Massaggi
-                ("d_massaggio_decontr", cid, "Massaggio decontratturante", 50, 50.0, Donna, "Massaggi"),
-                ("d_massaggio_rilass", cid, "Massaggio rilassante", 50, 45.0, Donna, "Massaggi"),
-                ("d_massaggio_drenante", cid, "Massaggio drenante", 60, 55.0, Donna, "Massaggi"),
-                ("d_massaggio_anticellulite", cid, "Massaggio anticellulite", 60, 58.0, Donna, "Massaggi"),
-                ("d_massaggio_svedese", cid, "Massaggio svedese", 60, 52.0, Donna, "Massaggi"),
-            ]
-        )
-        
-        # Servizi UOMO - Completi
-        uomo = "Uomo"
-        cur.executemany(
-            "INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price, gender, category) VALUES(?,?,?,?,?,?,?)",
-            [
-                # Trattamenti Viso
-                ("u_viso_pulizia", cid, "Pulizia del viso", 60, 40.0, uomo, "Trattamenti Viso"),
-                ("u_viso_purificante", cid, "Trattamento viso purificante", 45, 35.0, uomo, "Trattamenti Viso"),
-                ("u_viso_idratante", cid, "Trattamento viso idratante", 45, 35.0, uomo, "Trattamenti Viso"),
-                ("u_viso_anti_eta", cid, "Trattamento anti-eta", 60, 48.0, uomo, "Trattamenti Viso"),
-                
-                # Unghie
-                ("u_unghie_manicure", cid, "Manicure uomo", 30, 18.0, uomo, "Unghie"),
-                ("u_unghie_pedicure", cid, "Pedicure uomo", 40, 22.0, uomo, "Unghie"),
-                
-                # Estetica
-                ("u_estetica_sopracciglia", cid, "Definizione sopracciglia", 15, 8.0, uomo, "Estetica"),
-                ("u_estetica_epilazione_schiena", cid, "Epilazione schiena", 40, 30.0, uomo, "Estetica"),
-                ("u_estetica_ceretta_petto", cid, "Ceretta petto", 30, 25.0, uomo, "Estetica"),
-                ("u_estetica_ceretta_spalle", cid, "Ceretta spalle", 25, 20.0, uomo, "Estetica"),
-                
-                # Massaggi
-                ("u_massaggio_decontr", cid, "Massaggio decontratturante", 50, 50.0, uomo, "Massaggi"),
-                ("u_massaggio_sportivo", cid, "Massaggio sportivo", 60, 55.0, uomo, "Massaggi"),
-                ("u_massaggio_rilass", cid, "Massaggio rilassante", 50, 45.0, uomo, "Massaggi"),
-                ("u_massaggio_schiena", cid, "Massaggio schiena", 40, 40.0, uomo, "Massaggi"),
-                ("u_massaggio_cervicale", cid, "Massaggio cervicale", 30, 35.0, uomo, "Massaggi"),
-            ]
-        )
-        
-        # 🆕 NUOVI SERVIZI BEAUTY - DONNA (aggiuntivi)
-        cur.executemany(
-            "INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price, gender, category) VALUES(?,?,?,?,?,?,?)",
-            [
-                # Estetica
-                ("epilazione_completa_corpo", cid, "Epilazione completa corpo", 60, 35.0, Donna, "Estetica"),
-                ("sopracciglia_baffetti", cid, "Sopracciglia / Baffetti", 20, 10.0, Donna, "Estetica"),
-                ("ceretta_parziale", cid, "Ceretta parziale (gambe o braccia)", 30, 25.0, Donna, "Estetica"),
-                ("corpo_anticellulite", cid, "Trattamento corpo anticellulite", 50, 55.0, Donna, "Estetica"),
-                ("laminazione_ciglia_sopracciglia", cid, "Laminazione ciglia / sopracciglia", 40, 40.0, Donna, "Estetica"),
-                ("solarium", cid, "Solarium", 20, 15.0, Donna, "Estetica"),
-                ("trucco_giorno_sera", cid, "Trucco giorno / sera", 45, 50.0, Donna, "Estetica"),
-                
-                # Unghie
-                ("manicure_pedicure_base", cid, "Manicure / Pedicure base", 40, 25.0, Donna, "Unghie"),
-                ("smalto_semipermanente_mani", cid, "Smalto semipermanente mani", 30, 28.0, Donna, "Unghie"),
-                ("ricostruzione_unghie_gel_completa", cid, "Ricostruzione unghie in gel", 60, 45.0, Donna, "Unghie"),
-                
-                # Trattamenti Viso
-                ("pulizia_viso_base_donna", cid, "Pulizia viso base", 40, 35.0, Donna, "Trattamenti Viso"),
-                ("trattamento_viso_antiage_premium", cid, "Trattamento viso anti-age premium", 50, 60.0, Donna, "Trattamenti Viso"),
-                
-                # Massaggi
-                ("massaggio_rilassante_donna", cid, "Massaggio rilassante completo", 50, 50.0, Donna, "Massaggi"),
-                ("massaggio_drenante_gambe", cid, "Massaggio drenante gambe", 45, 45.0, Donna, "Massaggi"),
-            ]
-        )
-        
-        # 🆕 NUOVI SERVIZI BEAUTY - UOMO (aggiuntivi)
-        cur.executemany(
-            "INSERT OR REPLACE INTO services(code, center_id, title, duration_minutes, price, gender, category) VALUES(?,?,?,?,?,?,?)",
-            [
-                # Trattamenti Viso
-                ("taglio_barba_completo", cid, "Taglio capelli + Barba", 30, 25.0, uomo, "Trattamenti Viso"),
-                ("viso_purificante_uomo", cid, "Trattamento viso purificante uomo", 40, 38.0, uomo, "Trattamenti Viso"),
-                ("anticaduta_capelli", cid, "Trattamento anticaduta capelli", 40, 45.0, uomo, "Trattamenti Viso"),
-                ("viso_energizzante", cid, "Trattamento viso energizzante", 45, 42.0, uomo, "Trattamenti Viso"),
-                
-                # Massaggi
-                ("massaggio_decontratturante_uomo", cid, "Massaggio decontratturante completo", 50, 55.0, uomo, "Massaggi"),
-                ("massaggio_rilassante_uomo_full", cid, "Massaggio rilassante uomo", 50, 50.0, uomo, "Massaggi"),
-                ("trattamento_corpo_tonificante", cid, "Trattamento corpo tonificante", 45, 50.0, uomo, "Massaggi"),
-                
-                # Estetica
-                ("ceretta_torace_schiena", cid, "Ceretta torace / schiena", 35, 30.0, uomo, "Estetica"),
-                ("solarium_uomo", cid, "Solarium uomo", 20, 15.0, uomo, "Estetica"),
-                
-                # Unghie
-                ("cura_mani_piedi_uomo", cid, "Cura mani / piedi uomo", 40, 20.0, uomo, "Unghie"),
-            ]
-        )
-        
-        con.commit()
-        logger.info("[FULL] Dati di demo inseriti (Donna/Uomo con servizi completi).")
-    con.close()
+    ensure_sample_data()
+
+
+def FULL_is_admin(user_id: int) -> bool:
+    return user_id == FULL_ADMIN_CHAT_ID or is_admin(user_id)
 
 def FULL_parse_hhmm(s: str) -> time:
     h, m = map(int, s.split(":")); return time(hour=h, minute=m)
 
-def FULL_generate_slots_for_operator(operator_id: str, target_date: date) -> List[str]:
-    con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT * FROM operators WHERE id=?", (operator_id,)); op = cur.fetchone()
-    if not op: con.close(); return []
-    start = FULL_parse_hhmm(op["work_start"]); end = FULL_parse_hhmm(op["work_end"])
-    slot_minutes = 30; dt_start = datetime.combine(target_date, start); dt_end = datetime.combine(target_date, end); slots = []
-    cur.execute("SELECT DISTINCT time FROM bookings WHERE operator_id=? AND date=? AND status='CONFIRMED'", (operator_id, target_date.isoformat()))
-    taken = {r["time"] for r in cur.fetchall()}; s = dt_start
-    while s + timedelta(minutes=slot_minutes) <= dt_end:
-        hhmm = s.strftime("%H:%M");
-        if hhmm not in taken: slots.append(hhmm)
-        s += timedelta(minutes=slot_minutes)
-    con.close(); return slots
+def FULL_get_service_duration(svc_code: str) -> int:
+    con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT duration_minutes FROM services WHERE code=?", (svc_code,))
+    row = cur.fetchone(); con.close()
+    if row and row["duration_minutes"]:
+        try:
+            return int(row["duration_minutes"])
+        except Exception:
+            return SLOT_MINUTES
+    return SLOT_MINUTES
+
+def FULL_generate_slots_for_operator(operator_id: str, target_date: date, duration_minutes: int) -> List[str]:
+    try:
+        return free_slots_for_operator(target_date, duration_minutes, operator_id)
+    except Exception as exc:
+        logger.debug("[FULL] free_slots_for_operator failed: %s", exc)
+        return []
 
 def FULL_is_slot_available(operator_id: str, target_date: str, time_str: str) -> bool:
     con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT COUNT(*) FROM bookings WHERE operator_id=? AND date=? AND time=? AND status='CONFIRMED'", (operator_id, target_date, time_str)); ok = (cur.fetchone()[0] == 0); con.close(); return ok
 
-def FULL_day_status_symbol(target_date: date, op_id: str) -> str:
+def FULL_day_status_symbol(target_date: date, op_id: str, duration_minutes: int) -> str:
     """Restituisce 🟢 se ci sono slot disponibili, 🔴 se è pieno, '' se chiuso"""
-    slots = FULL_generate_slots_for_operator(op_id, target_date)
+    slots = FULL_generate_slots_for_operator(op_id, target_date, duration_minutes)
     if len(slots) > 0:
         return "🟢"
     elif len(slots) == 0:
@@ -2085,6 +1957,7 @@ def FULL_show_calendar_month(year: int, month: int, op_id: str, svc_code: str) -
     kb.append(header)
     
     today = date.today()
+    duration_minutes = FULL_get_service_duration(svc_code)
     
     # Righe del calendario
     for week in m:
@@ -2095,13 +1968,13 @@ def FULL_show_calendar_month(year: int, month: int, op_id: str, svc_code: str) -
             else:
                 ddate = date(year, month, day)
                 # Controlla se ci sono slot disponibili
-                slots = FULL_generate_slots_for_operator(op_id, ddate)
+                slots = FULL_generate_slots_for_operator(op_id, ddate, duration_minutes)
                 has_slots = len(slots) > 0
                 is_today = (ddate == today)
                 is_past = ddate < today
                 
                 # Aggiungi simbolo stato
-                symbol = FULL_day_status_symbol(ddate, op_id) if not is_past else ""
+                symbol = FULL_day_status_symbol(ddate, op_id, duration_minutes) if not is_past else ""
                 
                 if is_past:
                     row.append(InlineKeyboardButton("—", callback_data="ignore"))
@@ -2232,6 +2105,8 @@ async def FULL_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📋 Le mie prenotazioni", callback_data="full_my_bookings")],
         [InlineKeyboardButton("ℹ️ Help", callback_data="full_help")],
     ]
+    if FULL_is_admin(user.id):
+        kb.append([InlineKeyboardButton("📊 Statistiche", callback_data="full_stats_menu")])
     text = "Benvenuto in *PrenotaFacile* — scegli il profilo:"
     await update.message.reply_text(
         text,
@@ -2289,6 +2164,8 @@ async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("👩 Donna", callback_data="full_gender_Donna"), InlineKeyboardButton("👨 Uomo", callback_data="full_gender_Uomo")],
             [InlineKeyboardButton("📋 Le mie prenotazioni", callback_data="full_my_bookings")],
         ]
+        if FULL_is_admin(q.from_user.id):
+            kb.append([InlineKeyboardButton("📊 Statistiche", callback_data="full_stats_menu")])
         await q.edit_message_text("Menu principale:", reply_markup=InlineKeyboardMarkup(kb)); return
     if data.startswith("full_svc_"):
         svc_code = data.split("full_svc_")[1]
@@ -2296,7 +2173,12 @@ async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["full_svc_code"] = svc_code
         con = FULL_db_conn()
         cur = con.cursor()
-        cur.execute("SELECT * FROM operators LIMIT 5")
+        cur.execute("SELECT duration_minutes, title FROM services WHERE code=?", (svc_code,))
+        svc_row = cur.fetchone()
+        duration_minutes = svc_row["duration_minutes"] if svc_row and svc_row["duration_minutes"] else SLOT_MINUTES
+        context.user_data["full_service_duration"] = duration_minutes
+        context.user_data["full_service_title"] = svc_row["title"] if svc_row and svc_row["title"] else svc_code
+        cur.execute("SELECT id, name FROM operators ORDER BY name")
         ops = cur.fetchall()
         kb = []
         for op in ops:
@@ -2348,9 +2230,13 @@ async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         # Salva la data scelta per eventuale ritorno
         context.user_data["full_date_str"] = date_str
         # Mostra gli orari disponibili
-        slots = FULL_generate_slots_for_operator(op_id, date.fromisoformat(date_str))
+        duration_minutes = context.user_data.get("full_service_duration")
+        if duration_minutes is None:
+            duration_minutes = FULL_get_service_duration(svc_code)
+            context.user_data["full_service_duration"] = duration_minutes
+        slots = FULL_generate_slots_for_operator(op_id, date.fromisoformat(date_str), duration_minutes)
         kb = []
-        for t in slots[:8]:
+        for t in slots:
             kb.append([InlineKeyboardButton(t, callback_data=f"ft_{date_str}_{t}")])
         if not kb:
             await q.edit_message_text("Nessun orario disponibile per questo giorno.")
@@ -2423,20 +2309,94 @@ async def FULL_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
                           reply_markup=InlineKeyboardMarkup(kb), skip_warm_message=True)
         return
     if data == "full_my_bookings":
-        user = update.effective_user; con = FULL_db_conn(); cur = con.cursor(); cur.execute("SELECT id FROM clients WHERE tg_id=?", (user.id,)); r = cur.fetchone()
-        if not r: await update.callback_query.edit_message_text("Non hai prenotazioni."); con.close(); return
-        client_id = r["id"]
+        user = update.effective_user
+        con = FULL_db_conn(); cur = con.cursor()
+        cur.execute("SELECT id FROM clients WHERE tg_id=?", (user.id,))
+        client_row = cur.fetchone()
+        client_id = client_row["id"] if client_row else None
+
         cur.execute(
-            "SELECT b.id,b.date,b.time,b.service_code,s.title FROM bookings b LEFT JOIN services s ON b.service_code=s.code WHERE b.client_id=? AND b.status='CONFIRMED' ORDER BY b.date,b.time",
-            (client_id,)
-        ); rows = cur.fetchall()
-        if not rows: await update.callback_query.edit_message_text("Nessuna prenotazione attiva."); con.close(); return
-        out_lines = []
-        for b in rows:
-            title = b["title"] if b["title"] else b["service_code"]
-            out_lines.append(f"- ID {b['id']}: {b['date']} {b['time']} – {title}")
-        txt = "Le tue prenotazioni:\n" + "\n".join(out_lines)
-        await update.callback_query.edit_message_text(txt); con.close(); return
+            """
+            SELECT b.id, b.date, b.time, b.service_code, b.duration, b.operator_id, s.title
+            FROM bookings b
+            LEFT JOIN services s ON b.service_code = s.code
+            WHERE b.status='CONFIRMED' AND (b.client_id=? OR b.user_id=?)
+            ORDER BY b.date, b.time
+            """,
+            (client_id, user.id),
+        )
+        bookings = cur.fetchall()
+
+        cur.execute(
+            """
+            SELECT w.id, w.date, w.service_code
+            FROM waitlist w
+            WHERE (w.client_id=? OR w.user_id=?)
+            ORDER BY w.date, w.id
+            """,
+            (client_id, user.id),
+        )
+        waitlist_rows = cur.fetchall(); con.close()
+
+        if not bookings and not waitlist_rows:
+            await update.callback_query.edit_message_text("Non hai prenotazioni o liste d'attesa attive.")
+            return
+
+        lines: list[str] = []
+        if bookings:
+            lines.append(f"*📌 Prenotazioni confermate ({len(bookings)}):*")
+            for row in bookings:
+                bid, dstr, tstr, svc_code, duration, op_id, title = row
+                titolo = title or svc_code
+                giorno = datetime.strptime(dstr, "%Y-%m-%d").strftime("%d/%m/%Y")
+                lines.append(f"• ID {bid}: {giorno} {tstr} – {titolo} ({duration} min) – {operator_name(op_id)}")
+
+        if waitlist_rows:
+            if bookings:
+                lines.append("")
+            lines.append(f"*⏳ Liste d'attesa ({len(waitlist_rows)}):*")
+            for wid, dstr, svc_code in waitlist_rows:
+                svc = find_service_by_code(svc_code)
+                svc_name = svc["nome"] if svc else svc_code
+                giorno = datetime.strptime(dstr, "%Y-%m-%d").strftime("%d/%m/%Y")
+                lines.append(f"• W{wid}: {svc_name} – {giorno}")
+
+        kb_resp = [[InlineKeyboardButton("🏠 Menu", callback_data="full_home")]]
+        await update.callback_query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb_resp), parse_mode=ParseMode.MARKDOWN)
+        return
+    if data == "full_stats_menu":
+        if not FULL_is_admin(q.from_user.id):
+            await q.answer("Accesso negato", show_alert=True)
+            return
+        kb = [
+            [InlineKeyboardButton("📊 Statistiche oggi", callback_data="full_stats_day")],
+            [InlineKeyboardButton("📈 Statistiche settimana", callback_data="full_stats_week")],
+            [InlineKeyboardButton("⬅️ Indietro", callback_data="full_home")],
+        ]
+        await q.edit_message_text("Scegli il report statistico:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if data == "full_stats_day":
+        if not FULL_is_admin(q.from_user.id):
+            await q.answer("Accesso negato", show_alert=True)
+            return
+        report = get_daily_stats_text()
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Indietro", callback_data="full_stats_menu")]])
+        if not report:
+            await q.edit_message_text("Nessuna prenotazione oggi.", reply_markup=kb)
+        else:
+            await q.edit_message_text(report, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+    if data == "full_stats_week":
+        if not FULL_is_admin(q.from_user.id):
+            await q.answer("Accesso negato", show_alert=True)
+            return
+        report = get_weekly_stats_text()
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Indietro", callback_data="full_stats_menu")]])
+        if not report:
+            await q.edit_message_text("Nessuna prenotazione registrata questa settimana.", reply_markup=kb)
+        else:
+            await q.edit_message_text(report, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
     if data == "full_cancel":
         await update.callback_query.edit_message_text("Operazione annullata. Usa /start."); return
     await update.callback_query.answer()
